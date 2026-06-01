@@ -1,23 +1,29 @@
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-use super::{ClientState, Ordered, OrderedQueue, ReadDir, ReadDirCallback, ReadDirSpec};
+use super::{
+    ClientState, Ordered, OrderedQueue, PriorityQueue, ReadDir, ReadDirCallback, ReadDirSpec,
+    Weighted,
+};
 use crate::Result;
 
 pub(crate) struct RunContext<C: ClientState> {
     pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) read_dir_spec_queue: OrderedQueue<ReadDirSpec<C>>,
+    pub(crate) read_dir_spec_queue: PriorityQueue<ReadDirSpec<C>>,
     pub(crate) read_dir_result_queue: OrderedQueue<Result<ReadDir<C>>>,
     pub(crate) core_read_dir_callback: Arc<ReadDirCallback<C>>,
 }
 
 impl<C: ClientState> RunContext<C> {
     pub(crate) fn stop(&self) {
-        self.stop.store(true, AtomicOrdering::SeqCst);
+        self.stop.store(true, AtomicOrdering::Release);
     }
 
-    pub(crate) fn schedule_read_dir_spec(&self, ordered_read_dir: Ordered<ReadDirSpec<C>>) -> bool {
-        self.read_dir_spec_queue.push(ordered_read_dir).is_ok()
+    pub(crate) fn schedule_read_dir_spec(
+        &self,
+        weighted_read_dir: Weighted<ReadDirSpec<C>>,
+    ) -> bool {
+        self.read_dir_spec_queue.push(weighted_read_dir).is_ok()
     }
 
     pub(crate) fn send_read_dir_result(
@@ -28,7 +34,8 @@ impl<C: ClientState> RunContext<C> {
     }
 
     pub(crate) fn complete_item(&self) {
-        self.read_dir_spec_queue.complete_item()
+        self.read_dir_spec_queue.complete_item();
+        self.read_dir_result_queue.complete_item();
     }
 }
 

@@ -9,15 +9,19 @@ mod read_dir;
 mod read_dir_iter;
 mod read_dir_spec;
 mod run_context;
+mod priority_queue;
+mod weighted;
+#[cfg(windows)]
+mod nt_dir_enum;
 
 use rayon::prelude::*;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::vec;
 
 use index_path::*;
 use ordered::*;
 use ordered_queue::*;
+use priority_queue::*;
 use read_dir_iter::*;
 use run_context::*;
 
@@ -27,5 +31,11 @@ pub use error::Error;
 pub use read_dir::ReadDir;
 pub use read_dir_spec::ReadDirSpec;
 pub use metadata::{get_metadata_ext, MetaData, MetaDataExt};
+pub(crate) use weighted::Weighted;
+
+#[cfg(windows)]
+pub(crate) use nt_dir_enum::{enumerate_dir, enumerate_dir_streaming, query_volume_serial_number, query_number_of_links, DirEntryInfo};
+pub(crate) use read_dir_iter::StreamingContext;
+pub use ordered_queue::Ordering;
 
 use crate::{ClientState, Parallelism};

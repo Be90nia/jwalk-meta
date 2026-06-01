@@ -66,3 +66,5 @@ no_llvm_build
 
 /benches/assets/linux_checkout
 Cargo.lock
+.omo/
+graphify-out/

@@ -57,7 +57,7 @@ where
             ordering,
             receiver,
             ordered_matcher: OrderedMatcher::default(),
-            receive_buffer: BinaryHeap::new(),
+            receive_buffer: BinaryHeap::with_capacity(256),
             pending_count,
             stop,
         },
@@ -69,12 +69,12 @@ where
     T: Send,
 {
     pub fn push(&self, ordered: Ordered<T>) -> Result<(), SendError<Ordered<T>>> {
-        self.pending_count.fetch_add(1, AtomicOrdering::SeqCst);
+        self.pending_count.fetch_add(1, AtomicOrdering::Release);
         self.sender.send(ordered)
     }
 
     pub fn complete_item(&self) {
-        self.pending_count.fetch_sub(1, AtomicOrdering::SeqCst);
+        self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
 
@@ -96,11 +96,11 @@ where
     T: Send,
 {
     fn pending_count(&self) -> usize {
-        self.pending_count.load(AtomicOrdering::SeqCst)
+        self.pending_count.load(AtomicOrdering::Acquire)
     }
 
     fn is_stop(&self) -> bool {
-        self.stop.load(AtomicOrdering::SeqCst)
+        self.stop.load(AtomicOrdering::Acquire)
     }
 
     fn try_next_relaxed(&mut self) -> Result<Ordered<T>, TryRecvError> {
@@ -123,6 +123,7 @@ where
 
     fn try_next_strict(&mut self) -> Result<Ordered<T>, TryRecvError> {
         let looking_for = &self.ordered_matcher.looking_for;
+        let timeout = std::time::Duration::from_millis(1);
 
         loop {
             if self.is_stop() {
@@ -140,13 +141,21 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            match self.receiver.try_recv() {
+            match self.receiver.recv_timeout(timeout) {
                 Ok(ordered) => {
                     self.receive_buffer.push(ordered);
                 }
                 Err(err) => match err {
-                    TryRecvError::Empty => thread::yield_now(),
-                    TryRecvError::Disconnected => break,
+                    crossbeam::channel::RecvTimeoutError::Timeout => continue,
+                    crossbeam::channel::RecvTimeoutError::Disconnected => {
+                        let top = self.receive_buffer.peek();
+                        if let Some(top_ordered) = top {
+                            if top_ordered.index_path.eq(looking_for) {
+                                break;
+                            }
+                        }
+                        return Err(TryRecvError::Disconnected);
+                    }
                 },
             }
         }

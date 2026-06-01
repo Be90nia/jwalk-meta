@@ -83,6 +83,42 @@ impl<C: ClientState> DirEntry<C> {
         })
     }
 
+    /// 从 NT Native API 获取的原始数据创建 DirEntry。
+    ///
+    /// 与 `from_entry` 不同，此方法直接接受 `file_name`、`file_type` 和 `metadata`
+    /// 参数，无需从 `fs::DirEntry` 读取。
+    pub(crate) fn from_raw(
+        depth: usize,
+        parent_path: Arc<Path>,
+        metadata: Option<MetaData>,
+        metadata_ext: Option<MetaDataExt>,
+        file_name: OsString,
+        file_type: FileType,
+        follow_link_ancestors: Arc<Vec<Arc<Path>>>,
+    ) -> Result<Self> {
+        let read_children_path: Option<Arc<Path>> = if file_type.is_dir() {
+            Some(Arc::from(parent_path.join(&file_name)))
+        } else {
+            None
+        };
+
+        Ok(DirEntry {
+            depth,
+            file_name,
+            file_type,
+            parent_path,
+            read_children_path,
+            read_children_error: None,
+            client_state: C::DirEntryState::default(),
+            read_metadata: metadata.is_some(),
+            metadata,
+            read_metadata_ext: metadata_ext.is_some(),
+            metadata_ext,
+            follow_link: false,
+            follow_link_ancestors,
+        })
+    }
+
     // Only used for root and when following links.
     pub fn from_path(
         depth: usize,
