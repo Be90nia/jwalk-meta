@@ -8,19 +8,7 @@ use std::fs::{self, Permissions};
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-#[cfg(windows)]
-use std::ptr;
 use std::time::SystemTime;
-#[cfg(windows)]
-use std::{fs::File, mem::zeroed};
-#[cfg(windows)]
-use winapi::shared::minwindef::DWORD;
-#[cfg(windows)]
-use winapi::um::{
-    fileapi::GetFileInformationByHandle, fileapi::BY_HANDLE_FILE_INFORMATION,
-    ioapiset::DeviceIoControl, winioctl::FSCTL_GET_REPARSE_POINT,
-    winnt::FILE_ATTRIBUTE_REPARSE_POINT, winnt::MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-};
 
 #[inline]
 pub fn get_metadata_ext(metadata: &fs::Metadata) -> MetaDataExt {

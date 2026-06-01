@@ -34,8 +34,7 @@ pub use metadata::{get_metadata_ext, MetaData, MetaDataExt};
 pub(crate) use weighted::Weighted;
 
 #[cfg(windows)]
-pub(crate) use nt_dir_enum::{enumerate_dir, enumerate_dir_streaming, query_volume_serial_number, query_number_of_links, DirEntryInfo};
-pub(crate) use read_dir_iter::StreamingContext;
+pub(crate) use nt_dir_enum::{enumerate_dir, enumerate_dir_streaming, DirEntryInfo};
 pub use ordered_queue::Ordering;
 
 use crate::{ClientState, Parallelism};

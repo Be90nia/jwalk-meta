@@ -17,6 +17,7 @@ where
 }
 
 pub enum Ordering {
+    #[allow(dead_code)]
     Relaxed,
     Strict,
 }

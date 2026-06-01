@@ -10,10 +10,9 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::{io, ptr};
 
-use winapi::shared::minwindef::DWORD;
 use winapi::shared::ntdef::{HANDLE, LPCWSTR};
 use winapi::um::fileapi::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, GetFileInformationByHandle, OPEN_EXISTING,
+    CreateFileW, OPEN_EXISTING,
 };
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
 use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
@@ -36,6 +35,7 @@ const STATUS_NO_MORE_FILES: i32 = -2147483642; // 0x80000006
 /// NtQueryDirectoryFileEx 返回的目录条目信息结构。
 /// 对应 Windows FILE_ID_BOTH_DIR_INFO。
 #[repr(C)]
+#[allow(non_snake_case)]
 struct FILE_ID_BOTH_DIR_INFO {
     NextEntryOffset: u32,
     FileIndex: u32,
@@ -56,6 +56,7 @@ struct FILE_ID_BOTH_DIR_INFO {
 
 /// NT I/O 状态块，NtQueryDirectoryFileEx 的输出参数。
 #[repr(C)]
+#[allow(non_snake_case)]
 struct IO_STATUS_BLOCK {
     Status: i32,
     Information: usize,
@@ -64,6 +65,7 @@ struct IO_STATUS_BLOCK {
 // ── 动态加载 ntdll ─────────────────────────────────────────────────────
 
 /// NtQueryDirectoryFileEx 函数签名。
+#[allow(non_snake_case)]
 type NtQueryDirectoryFileExFn = unsafe extern "system" fn(
     FileHandle: HANDLE,
     Event: HANDLE,
@@ -407,49 +409,4 @@ pub fn enumerate_dir_streaming(
     Ok(result)
 }
 
-// ── 辅助查询函数 ───────────────────────────────────────────────────────
 
-/// 通过 GetFileInformationByHandle 查询文件的 BY_HANDLE_FILE_INFORMATION。
-/// 失败时静默返回 None，不 panic。
-pub fn query_by_handle_info(path: &Path) -> Option<BY_HANDLE_FILE_INFORMATION> {
-    let wide_path = path_to_widestring(path);
-
-    // SAFETY: CreateFileW 打开已存在的文件，参数合法。
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-
-    let guard = HandleGuard(handle);
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-
-    // SAFETY: handle 有效，info 是栈上的合法输出缓冲区。
-    let result = unsafe { GetFileInformationByHandle(guard.0, &mut info) };
-
-    if result == 0 {
-        None
-    } else {
-        Some(info)
-    }
-}
-
-/// 查询路径所在卷的序列号。失败时返回 None。
-pub fn query_volume_serial_number(path: &Path) -> Option<u32> {
-    query_by_handle_info(path).map(|info| info.dwVolumeSerialNumber)
-}
-
-/// 查询文件的硬链接数。需要单独打开 handle（开销较大）。失败时返回 None。
-pub fn query_number_of_links(path: &Path) -> Option<u32> {
-    query_by_handle_info(path).map(|info| info.nNumberOfLinks)
-}

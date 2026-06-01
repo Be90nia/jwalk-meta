@@ -475,7 +475,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                 // ── Windows NT Native API fast path ──
                 #[cfg(windows)]
                 {
-                    use crate::core::{enumerate_dir, enumerate_dir_streaming, DirEntryInfo, StreamingContext};
+                    use crate::core::{enumerate_dir, enumerate_dir_streaming, DirEntryInfo};
 
                     // Windows FILETIME epoch (1601-01-01) to UNIX epoch offset in 100ns ticks
                     const EPOCH_DIFFERENCE_100NS: i64 = 116_444_736_000_000_000;

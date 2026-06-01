@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::{
@@ -15,10 +15,6 @@ pub(crate) struct RunContext<C: ClientState> {
 }
 
 impl<C: ClientState> RunContext<C> {
-    pub(crate) fn stop(&self) {
-        self.stop.store(true, AtomicOrdering::Release);
-    }
-
     pub(crate) fn schedule_read_dir_spec(
         &self,
         weighted_read_dir: Weighted<ReadDirSpec<C>>,
