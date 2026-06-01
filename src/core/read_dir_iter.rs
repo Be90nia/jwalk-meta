@@ -16,13 +16,18 @@ pub(crate) type ReadDirCallback<C> =
 pub(crate) struct StreamingContext<C: ClientState> {
     pub index_path: IndexPath,
     run_context: RunContext<C>,
+    /// 父目录的调度权重，用于优先淹没算法的权重继承。
+    /// 子目录权重 = parent_weight + 已发现子目录数，
+    /// 确保大管道（多子目录）的分支也获得高优先级。
+    pub parent_weight: usize,
 }
 
 impl<C: ClientState> StreamingContext<C> {
-    pub(crate) fn new(index_path: IndexPath, run_context: RunContext<C>) -> Self {
+    pub(crate) fn new(index_path: IndexPath, run_context: RunContext<C>, parent_weight: usize) -> Self {
         StreamingContext {
             index_path,
             run_context,
+            parent_weight,
         }
     }
 
@@ -68,9 +73,10 @@ impl<C: ClientState> ReadDirIter<C> {
             let (read_dir_spec_queue, read_dir_spec_iter) =
                 new_priority_queue(stop.clone());
 
+            // 根目录使用最大权重，确保最先被调度（优先淹没算法）
             for read_dir_spec in read_dir_specs.into_iter() {
                 read_dir_spec_queue
-                    .push(Weighted::new(read_dir_spec, IndexPath::new(vec![0]), 0))
+                    .push(Weighted::new(read_dir_spec, IndexPath::new(vec![0]), usize::MAX))
                     .unwrap();
             }
 
@@ -156,11 +162,11 @@ fn multi_threaded_walk_dir<C: ClientState>(
     let Weighted {
         value: read_dir_spec,
         index_path,
-        ..
+        weight: parent_weight,
     } = weighted_read_dir_spec;
 
-    // 创建流式分发上下文，传递给 callback
-    let streaming_ctx = StreamingContext::new(index_path.clone(), run_context.clone());
+    // 创建流式分发上下文，传递父权重用于优先淹没算法的权重继承
+    let streaming_ctx = StreamingContext::new(index_path.clone(), run_context.clone(), parent_weight);
 
     let read_dir_result = (run_context.core_read_dir_callback)(read_dir_spec, Some(streaming_ctx));
 
@@ -174,7 +180,7 @@ fn multi_threaded_walk_dir<C: ClientState>(
         read_dir_result
             .as_ref()
             .ok()
-            .map(|read_dir| read_dir.weighted_children_specs(&index_path))
+            .map(|read_dir| read_dir.weighted_children_specs(&index_path, parent_weight))
     } else {
         None
     };

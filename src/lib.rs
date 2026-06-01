@@ -570,6 +570,11 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
 
                         let ctx = streaming_ctx.as_ref().unwrap();
 
+                        // 优先淹没算法：weight = parent_weight + subdir_count
+                        // parent_weight 继承父目录权重（大管道的分支也是大管道）
+                        // subdir_count 递增确保子目录越多的父目录权重越高
+                        let parent_weight = ctx.parent_weight;
+
                         enumerate_dir_streaming(path.as_ref(), |dir_info| {
                             // 跳过隐藏目录
                             if skip_hidden && is_hidden(&dir_info.file_name) {
@@ -591,9 +596,10 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                                 follow_link_ancestors: follow_link_ancestors.clone(),
                             };
 
-                            // 设置当前子目录的 IndexPath
+                            // 优先淹没算法：weight = parent_weight + 已发现子目录数
+                            let weight = parent_weight + streamed_count.get() + 1;
                             *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
-                            ctx.schedule(Weighted::new(spec, child_index_path.clone(), 1));
+                            ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight));
                             streamed_count.set(streamed_count.get() + 1);
                         })
                     } else {
