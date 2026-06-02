@@ -1,6 +1,6 @@
 //! Priority queue backed by a channel and BinaryHeap.
 
-use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError};
+use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError, TrySendError};
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -60,12 +60,19 @@ impl<T> PriorityQueue<T>
 where
     T: Send,
 {
+    /// 非阻塞 push：使用 try_send 避免在 channel 满时阻塞调用线程。
+    /// 在 streaming 模式下，调用方可能处于 I/O 回调中持有目录句柄，
+    /// 阻塞会导致后续条目无法读取（jwalk-meta-1vo）。
     pub fn push(&self, weighted: Weighted<T>) -> Result<(), SendError<Weighted<T>>> {
-        let result = self.sender.send(weighted);
-        if result.is_ok() {
-            self.pending_count.fetch_add(1, AtomicOrdering::Release);
+        let result = self.sender.try_send(weighted);
+        match result {
+            Ok(()) => {
+                self.pending_count.fetch_add(1, AtomicOrdering::Release);
+                Ok(())
+            }
+            Err(TrySendError::Full(val)) => Err(SendError(val)),
+            Err(TrySendError::Disconnected(val)) => Err(SendError(val)),
         }
-        result
     }
 
     pub fn complete_item(&self) {

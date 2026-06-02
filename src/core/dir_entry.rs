@@ -43,7 +43,10 @@ pub struct DirEntry<C: ClientState> {
     pub metadata_ext: Option<MetaDataExt>,
     // True if [`follow_links`] is `true` AND was created from a symlink path.
     follow_link: bool,
-    // Origins of symlinks followed to get to this entry.
+    // 符号链接祖先路径列表，用 Arc 共享避免 O(depth) 克隆。
+    // 循环检测通过 metadata identity (dev+ino / vol+file_index) 实现，
+    // 每次检测需 O(depth) 次 fs::metadata 系统调用。
+    // 未来优化方向：缓存 ancestor 的 metadata identity 避免重复 stat。
     follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
     // Lazily cached full path (parent_path + file_name).
     cached_path: OnceLock<PathBuf>,
@@ -319,6 +322,9 @@ impl<C: ClientState> DirEntry<C> {
             if let Ok(target_meta) = fs::metadata(&canonical_target) {
                 let target_ext = get_metadata_ext(&target_meta);
 
+                // TODO(jwalk-meta-wwy): 当前每次循环检测需 O(depth) 次 stat 系统调用。
+                // 可预计算 ancestor 的 MetaDataExt 并存入 ancestors 列表，
+                // 将循环检测从 O(depth) syscalls 降为 O(depth) 内存比较。
                 if let Some(ancestors) = &self.follow_link_ancestors {
                     for ancestor in ancestors.iter().rev() {
                         if let Ok(ancestor_meta) = fs::metadata(ancestor.as_ref()) {

@@ -562,6 +562,11 @@ impl Parallelism {
             Parallelism::Serial => op(),
             Parallelism::RayonDefaultPool { .. } => rayon::spawn(op),
             Parallelism::RayonNewPool(num_threads) => {
+                // TLS 线程池复用（jwalk-meta-naz / jwalk-meta-8cl）：
+                // 同一线程内所有 WalkDir 实例共享同一个 ThreadPool，
+                // 避免频繁创建/销毁线程池的开销。
+                // 线程池随宿主线程生命周期销毁，rayon::ThreadPool::drop 会
+                // 等待所有工作线程完成后才释放资源。
                 thread_local! {
                     static TLS_POOL: std::cell::RefCell<Option<rayon::ThreadPool>> = std::cell::RefCell::new(None);
                 }
