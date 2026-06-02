@@ -29,6 +29,10 @@ where
 /// 设为 1024，约等于 rayon 默认线程数 × 128，平衡吞吐与内存。
 const CHANNEL_CAPACITY: usize = 1024;
 
+/// BinaryHeap 初始容量：256 是经验值，平衡初始内存占用和重新分配次数。
+/// 普通目录子项数通常 < 256，避免首次扩展。
+const INITIAL_HEAP_CAPACITY: usize = 256;
+
 pub(crate) fn new_priority_queue<T>(
     stop: Arc<AtomicBool>,
 ) -> (PriorityQueue<T>, PriorityQueueIter<T>)
@@ -45,7 +49,7 @@ where
         },
         PriorityQueueIter {
             receiver,
-            receive_buffer: BinaryHeap::with_capacity(256),
+            receive_buffer: BinaryHeap::with_capacity(INITIAL_HEAP_CAPACITY),
             pending_count,
             stop,
         },
@@ -65,6 +69,9 @@ where
     }
 
     pub fn complete_item(&self) {
+        // NOTE: fetch_sub 无 saturating 版本；若 count=0 会下溢为 usize::MAX。
+        // 安全性依赖上游逻辑保证 complete_item 只在 push 成功后调用。
+        // 参见 jwalk-meta-lbi / jwalk-meta-779 的 push-send 时序修复。
         self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
@@ -87,10 +94,12 @@ where
     T: Send,
 {
     fn pending_count(&self) -> usize {
+        // Acquire: 与 push 中的 Release 配对，确保看到完整的数据写入。
         self.pending_count.load(AtomicOrdering::Acquire)
     }
 
     fn is_stop(&self) -> bool {
+        // Acquire: 确保看到 stop 标志的最新值，由 producer 端 Release 写入。
         self.stop.load(AtomicOrdering::Acquire)
     }
 

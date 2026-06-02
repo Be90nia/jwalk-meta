@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+/// BinaryHeap 初始容量：256 是经验值，平衡初始内存占用和重新分配次数。
+const INITIAL_HEAP_CAPACITY: usize = 256;
+
 /// Strict 模式等待队头元素的最大时长，超时后降级为弹出最高优先级元素。
 const STRICT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -65,7 +68,7 @@ where
             ordering,
             receiver,
             ordered_matcher: OrderedMatcher::default(),
-            receive_buffer: BinaryHeap::with_capacity(256),
+            receive_buffer: BinaryHeap::with_capacity(INITIAL_HEAP_CAPACITY),
             pending_count,
             stop,
         },
@@ -79,12 +82,16 @@ where
     pub fn push(&self, ordered: Ordered<T>) -> Result<(), SendError<Ordered<T>>> {
         let result = self.sender.send(ordered);
         if result.is_ok() {
+            // Release: 确保 ordered 数据写入在 pending_count 递增之前对其他线程可见。
+            // 消费者 load(Acquire) 配对，确保看到完整的 ordered 数据。
             self.pending_count.fetch_add(1, AtomicOrdering::Release);
         }
         result
     }
 
     pub fn complete_item(&self) {
+        // AcqRel: Acquire 确保看到之前所有 push 的数据；
+        // Release 确保消费者 is_empty() load(Acquire) 能看到递减后的值。
         self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }
@@ -107,10 +114,12 @@ where
     T: Send,
 {
     fn pending_count(&self) -> usize {
+        // Acquire: 与 push 中的 Release 配对，确保看到完整的数据写入。
         self.pending_count.load(AtomicOrdering::Acquire)
     }
 
     fn is_stop(&self) -> bool {
+        // Acquire: 确保看到 stop 标志的最新值，由 producer 端 Release 写入。
         self.stop.load(AtomicOrdering::Acquire)
     }
 

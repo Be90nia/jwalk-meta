@@ -177,6 +177,12 @@ impl Error {
         }
     }
 
+    /// 线程池繁忙时返回的错误。
+    ///
+    /// `depth` 设为 0 是合理的：此错误不关联任何文件路径，
+    /// 而是表示线程池无法接受新的遍历任务。
+    /// 调用者应通过 [`from_path`] 或 [`from_entry`] 报告
+    /// 带有正确 depth 的路径相关错误。
     pub(crate) fn busy() -> Self {
         Error {
             depth: 0,
@@ -197,7 +203,7 @@ impl Error {
         Error {
             depth: dent.depth(),
             inner: ErrorInner::Io {
-                path: Some(dent.path()),
+                path: Some(dent.path().to_path_buf()),
                 err,
             },
         }

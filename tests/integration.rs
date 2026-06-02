@@ -1032,7 +1032,7 @@ fn walk_root() {
         .max_depth(1)
         .sort(true)
         .into_iter()
-        .filter_map(|each| Some(each.ok()?.path()))
+        .filter_map(|each| Some(each.ok()?.path().to_path_buf()))
         .collect();
     assert_eq!(paths.first().unwrap().to_str().unwrap(), "/");
 }
@@ -1152,7 +1152,8 @@ fn test_read_linux() {
     let linux_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/assets/linux_checkout");
     if linux_dir.exists() {
         for each in WalkDir::new(linux_dir) {
-            let path = each.unwrap().path();
+            let entry = each.unwrap();
+            let path = entry.path();
             assert!(path.exists(), "{:?}", path);
         }
     }

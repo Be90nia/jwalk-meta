@@ -153,6 +153,7 @@ impl<C: ClientState> DirEntry<C> {
     }
 
     /// Create a DirEntry from a std::fs::DirEntry (non-Windows path).
+    #[allow(dead_code)]
     pub(crate) fn from_entry(
         depth: usize,
         parent_path: Arc<Path>,
@@ -219,10 +220,11 @@ impl<C: ClientState> DirEntry<C> {
     ///
     /// The path is created by joining `parent_path` with `file_name`.
     /// Result is cached in OnceLock to avoid repeated allocations.
-    pub fn path(&self) -> PathBuf {
+    /// Returns a reference to the cached path, avoiding clone overhead.
+    pub fn path(&self) -> &Path {
         self.cached_path
             .get_or_init(|| self.parent_path.join(&self.file_name))
-            .clone()
+            .as_path()
     }
 
     /// Returns `true` if and only if this entry was created from a symbolic
@@ -294,7 +296,7 @@ impl<C: ClientState> DirEntry<C> {
         let origins = self.follow_link_ancestors.clone();
         let dir_entry = DirEntry::from_path(
             self.depth,
-            &path,
+            path,
             self.read_metadata,
             self.read_metadata_ext,
             true,
@@ -302,14 +304,25 @@ impl<C: ClientState> DirEntry<C> {
         )?;
 
         if dir_entry.file_type.is_dir() {
-            let target = fs::read_link(&path).map_err(|err| Error::from_io(self.depth, err))?;
+            let target = fs::read_link(path).map_err(|err| Error::from_io(self.depth, err))?;
+            // 解析符号链接目标为绝对路径，防止相对路径绕过循环检测
+            let resolved_target = if target.is_absolute() {
+                target
+            } else {
+                // 相对符号链接：基于链接所在目录解析
+                self.parent_path.join(&target)
+            };
+            let canonical_target = resolved_target.canonicalize().ok().unwrap_or(resolved_target);
+
             if let Some(ancestors) = &self.follow_link_ancestors {
                 for ancestor in ancestors.iter().rev() {
-                    if target.as_path() == ancestor.as_ref() {
+                    // 对祖先也做 canonicalize 以确保路径比较准确
+                    let canonical_ancestor = ancestor.canonicalize().ok().unwrap_or_else(|| ancestor.as_ref().to_path_buf());
+                    if canonical_target == canonical_ancestor {
                         return Err(Error::from_loop(
                             self.depth,
                             ancestor.as_ref(),
-                            path.as_ref(),
+                            path,
                         ));
                     }
                 }

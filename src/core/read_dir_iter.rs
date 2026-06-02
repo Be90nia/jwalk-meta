@@ -78,9 +78,10 @@ impl<C: ClientState> ReadDirIter<C> {
             // 使用 (usize::MAX >> 1) 避免 parent_weight + child_count 溢出
             const ROOT_WEIGHT: usize = usize::MAX >> 1;
             for read_dir_spec in read_dir_specs.into_iter() {
+                // 初始化阶段 channel 不可能满（刚创建），但用 expect 明确语义
                 read_dir_spec_queue
                     .push(Weighted::new(read_dir_spec, IndexPath::new(vec![0]), ROOT_WEIGHT))
-                    .unwrap();
+                    .expect("init: priority queue push should not fail");
             }
 
             let run_context = RunContext {

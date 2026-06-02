@@ -50,7 +50,7 @@ impl<C: ClientState> RecursiveResults<C> {
     ///
     /// This does not include paths that correspond to an error.
     pub fn paths(&self) -> Vec<PathBuf> {
-        self.ents.iter().map(|d| d.path()).collect()
+        self.ents.iter().map(|d| d.path().to_path_buf()).collect()
     }
 
     /*

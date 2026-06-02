@@ -1,4 +1,6 @@
-//! FIXME: A workaround to fix https://github.com/timberio/vector/issues/1480 resulting from https://github.com/rust-lang/rust/issues/63010
+//! Workaround for https://github.com/rust-lang/rust/issues/63010
+//! (originally reported as https://github.com/timberio/vector/issues/1480).
+//!
 //! Most of code is cribbed directly from the Rust stdlib and ported to work with winapi.
 //!
 //! In stdlib imported code, warnings are allowed.

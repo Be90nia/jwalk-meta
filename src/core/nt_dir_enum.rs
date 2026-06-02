@@ -175,15 +175,11 @@ fn ntstatus_to_io_error(status: i32, funcs: &NtDllFuncs) -> io::Error {
 
 // ── 核心枚举函数 ───────────────────────────────────────────────────────
 
-/// 使用 NtQueryDirectoryFileEx 批量枚举目录中的所有文件和子目录。
+/// 打开目录句柄，返回 RAII 守卫。
 ///
-/// 返回除 "." 和 ".." 外的所有条目。使用 64KB 缓冲区减少系统调用次数，
-/// 并预分配 Vec 以减少堆重分配。
-pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInfo>> {
+/// SAFETY: CreateFileW 参数合法，FILE_FLAG_BACKUP_SEMANTICS 允许打开目录。
+fn open_dir_handle(path: &Path) -> io::Result<HandleGuard> {
     let wide_path = path_to_widestring(path);
-    let funcs = ntdll_funcs();
-
-    // SAFETY: CreateFileW 参数合法，FILE_FLAG_BACKUP_SEMANTICS 允许打开目录。
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
@@ -200,9 +196,69 @@ pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInf
         return Err(io::Error::last_os_error());
     }
 
-    let guard = HandleGuard(handle);
+    Ok(HandleGuard(handle))
+}
+
+/// 解析单次 NtQueryDirectoryFileEx 返回的 buffer，提取目录条目。
+///
+/// 对每个非 "."/".." 条目调用 `on_entry` 回调。
+///
+/// SAFETY: 调用者必须保证 buffer 包含有效的 NT API 返回数据。
+fn parse_buffer_entries(
+    buffer: &[u8],
+    mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, &OsString),
+) {
+    let mut offset: usize = 0;
+    loop {
+        // SAFETY: offset 从 0 开始，每次递增 NextEntryOffset（对齐的 u32），
+        // 且 bytes_returned 保证 offset < bytes_returned <= buffer.len()
+        let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
+        // SAFETY: entry_ptr 指向 buffer 中有效的 FILE_ID_BOTH_DIR_INFO 数据。
+        // 结构体对齐由 NT API 保证（4 字节对齐）。
+        let entry = unsafe { &*(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
+
+        let name_len = entry.FileNameLength as usize;
+        let name_chars = name_len / 2;
+
+        // Raw UTF-16 比较 "." 和 ".."，避免 to_string_lossy 堆分配
+        // FileName 是 C 变长数组 ([u16; 1])，必须用指针访问避免编译器越界检查
+        let first_char = entry.FileName[0];
+        let is_dot = name_chars == 1 && first_char == b'.' as u16;
+        let is_dotdot = name_chars == 2
+            && first_char == b'.' as u16
+            // SAFETY: name_chars == 2 guarantees at least 2 u16 elements in FileName
+            && unsafe { *entry.FileName.as_ptr().add(1) } == b'.' as u16;
+
+        if !is_dot && !is_dotdot {
+            // SAFETY: FileName 的字节数由 FileNameLength 保证，从 offset+offsetof(FileName) 开始。
+            let name_slice = unsafe {
+                let name_start =
+                    entry_ptr.add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName));
+                std::slice::from_raw_parts(name_start as *const u16, name_chars)
+            };
+            let file_name = OsString::from_wide(name_slice);
+
+            on_entry(entry, &file_name);
+        }
+
+        let next_offset = entry.NextEntryOffset;
+        if next_offset == 0 {
+            break;
+        }
+        offset += next_offset as usize;
+    }
+}
+
+/// 核心枚举循环：NtQueryDirectoryFileEx 批量查询 + buffer 解析。
+///
+/// `on_entry` 对每个非 "."/".." 条目调用，接收解析出的原始 entry 和文件名。
+/// 调用者负责构造 `DirEntryInfo` 并决定是否收集/分发。
+fn enumerate_dir_core(
+    guard: &HandleGuard,
+    funcs: &NtDllFuncs,
+    mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, &OsString),
+) -> io::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut result = Vec::with_capacity(capacity);
 
     // 首次调用时 RestartScan = 1（重新开始扫描）
     let mut restart_scan: i32 = 1;
@@ -246,54 +302,32 @@ pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInf
             break;
         }
 
-        let mut offset: usize = 0;
-        loop {
-            // SAFETY: offset 从 0 开始，每次递增 NextEntryOffset（对齐的 u32），
-            // 且 bytes_returned 保证 offset < bytes_returned <= buffer.len()
-            let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
-            // SAFETY: entry_ptr 指向 buffer 中有效的 FILE_ID_BOTH_DIR_INFO 数据。
-            // 结构体对齐由 NT API 保证（4 字节对齐）。
-            let entry = unsafe { &*(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
-
-            let name_len = entry.FileNameLength as usize;
-            let name_chars = name_len / 2;
-
-            // Raw UTF-16 比较 "." 和 ".."，避免 to_string_lossy 堆分配
-            // FileName 是 C 变长数组 ([u16; 1])，必须用指针访问避免编译器越界检查
-            let first_char = entry.FileName[0];
-            let is_dot = name_chars == 1 && first_char == b'.' as u16;
-            let is_dotdot = name_chars == 2
-                && first_char == b'.' as u16
-                // SAFETY: name_chars == 2 guarantees at least 2 u16 elements in FileName
-                && unsafe { *entry.FileName.as_ptr().add(1) } == b'.' as u16;
-
-            if !is_dot && !is_dotdot {
-                // SAFETY: FileName 的字节数由 FileNameLength 保证，从 offset+offsetof(FileName) 开始。
-                let name_slice = unsafe {
-                    let name_start =
-                        entry_ptr.add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName));
-                    std::slice::from_raw_parts(name_start as *const u16, name_chars)
-                };
-                let file_name = OsString::from_wide(name_slice);
-
-                result.push(DirEntryInfo {
-                    file_name,
-                    file_attributes: entry.FileAttributes,
-                    file_size: entry.EndOfFile as u64,
-                    creation_time: entry.CreationTime,
-                    last_write_time: entry.LastWriteTime,
-                    last_access_time: entry.LastAccessTime,
-                    file_id: entry.FileId as u64,
-                });
-            }
-
-            let next_offset = entry.NextEntryOffset;
-            if next_offset == 0 {
-                break;
-            }
-            offset += next_offset as usize;
-        }
+        parse_buffer_entries(&buffer, &mut on_entry);
     }
+
+    Ok(())
+}
+
+/// 使用 NtQueryDirectoryFileEx 批量枚举目录中的所有文件和子目录。
+///
+/// 返回除 "." 和 ".." 外的所有条目。使用 64KB 缓冲区减少系统调用次数，
+/// 并预分配 Vec 以减少堆重分配。
+pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInfo>> {
+    let funcs = ntdll_funcs();
+    let guard = open_dir_handle(path)?;
+    let mut result = Vec::with_capacity(capacity);
+
+    enumerate_dir_core(&guard, funcs, |entry, file_name| {
+        result.push(DirEntryInfo {
+            file_name: file_name.clone(),
+            file_attributes: entry.FileAttributes,
+            file_size: entry.EndOfFile as u64,
+            creation_time: entry.CreationTime,
+            last_write_time: entry.LastWriteTime,
+            last_access_time: entry.LastAccessTime,
+            file_id: entry.FileId as u64,
+        });
+    })?;
 
     Ok(result)
 }
@@ -307,122 +341,28 @@ pub fn enumerate_dir_streaming(
     capacity: usize,
     mut on_subdir: impl FnMut(&DirEntryInfo),
 ) -> io::Result<Vec<DirEntryInfo>> {
-    let wide_path = path_to_widestring(path);
     let funcs = ntdll_funcs();
-
-    // SAFETY: 同 enumerate_dir 的安全说明。
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            ptr::null_mut(),
-        )
-    };
-
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-
-    let guard = HandleGuard(handle);
-    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let guard = open_dir_handle(path)?;
     let mut result = Vec::with_capacity(capacity);
 
-    let mut restart_scan: i32 = 1;
-
-    loop {
-        let mut iosb = IO_STATUS_BLOCK {
-            Status: 0,
-            Information: 0,
+    enumerate_dir_core(&guard, funcs, |entry, file_name| {
+        let info = DirEntryInfo {
+            file_name: file_name.clone(),
+            file_attributes: entry.FileAttributes,
+            file_size: entry.EndOfFile as u64,
+            creation_time: entry.CreationTime,
+            last_write_time: entry.LastWriteTime,
+            last_access_time: entry.LastAccessTime,
+            file_id: entry.FileId as u64,
         };
 
-        // SAFETY: 同 enumerate_dir。
-        let status = unsafe {
-            (funcs.query_dir)(
-                guard.0,
-                ptr::null_mut(),
-                None,
-                ptr::null_mut(),
-                &mut iosb,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                FILE_ID_BOTH_DIR_INFO_CLASS,
-                0,
-                ptr::null(),
-                restart_scan,
-            )
-        };
-
-        restart_scan = 0;
-
-        if status != 0 {
-            if status == STATUS_NO_MORE_FILES {
-                break;
-            }
-            return Err(ntstatus_to_io_error(status, funcs));
+        // FILE_ATTRIBUTE_DIRECTORY = 0x10
+        if info.file_attributes & 0x10 != 0 {
+            on_subdir(&info);
         }
 
-        let bytes_returned = iosb.Information;
-        if bytes_returned == 0 {
-            break;
-        }
-
-        let mut offset: usize = 0;
-        loop {
-            // SAFETY: 同 enumerate_dir 中的 offset 边界保证
-            let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
-            // SAFETY: 同 enumerate_dir。
-            let entry = unsafe { &*(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
-
-            let name_len = entry.FileNameLength as usize;
-            let name_chars = name_len / 2;
-
-            // FileName 是 C 变长数组，必须用指针访问避免编译器越界检查
-            let first_char = entry.FileName[0];
-            let is_dot = name_chars == 1 && first_char == b'.' as u16;
-            let is_dotdot = name_chars == 2
-                && first_char == b'.' as u16
-                // SAFETY: name_chars == 2 guarantees at least 2 u16 elements in FileName
-                && unsafe { *entry.FileName.as_ptr().add(1) } == b'.' as u16;
-
-            if !is_dot && !is_dotdot {
-                let name_slice = unsafe {
-                    let name_start =
-                        entry_ptr.add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName));
-                    std::slice::from_raw_parts(name_start as *const u16, name_chars)
-                };
-                let file_name = OsString::from_wide(name_slice);
-
-                let info = DirEntryInfo {
-                    file_name,
-                    file_attributes: entry.FileAttributes,
-                    file_size: entry.EndOfFile as u64,
-                    creation_time: entry.CreationTime,
-                    last_write_time: entry.LastWriteTime,
-                    last_access_time: entry.LastAccessTime,
-                    file_id: entry.FileId as u64,
-                };
-
-                // FILE_ATTRIBUTE_DIRECTORY = 0x10
-                if info.file_attributes & 0x10 != 0 {
-                    on_subdir(&info);
-                }
-
-                result.push(info);
-            }
-
-            let next_offset = entry.NextEntryOffset;
-            if next_offset == 0 {
-                break;
-            }
-            offset += next_offset as usize;
-        }
-    }
+        result.push(info);
+    })?;
 
     Ok(result)
 }
-
-

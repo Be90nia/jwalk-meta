@@ -229,7 +229,7 @@ impl<C: ClientState> WalkDirGeneric<C> {
             options: WalkDirOptions {
             sort: false,
                 min_depth: 0,
-                max_depth: ::std::usize::MAX,
+                max_depth: usize::MAX,
                 skip_hidden: false,
                 follow_links: false,
                 read_metadata: false,
@@ -404,7 +404,7 @@ fn process_dir_entry_result<C: ClientState>(
                 // should report itself as a symlink. When it's enabled, it
                 // should always report itself as the target.
                 let metadata = fs::metadata(dir_entry.path())
-                    .map_err(|err| Error::from_path(0, dir_entry.path(), err))?;
+                    .map_err(|err| Error::from_path(0, dir_entry.path().to_owned(), err))?;
                 if metadata.file_type().is_dir() {
                     dir_entry.read_children_path = Some(Arc::from(dir_entry.path()));
                 }
@@ -469,12 +469,13 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                 let ReadDirSpec {
                     path,
                     depth,
-                    mut client_read_state,
+                    client_read_state,
                     mut follow_link_ancestors,
                 } = read_dir_spec;
 
                 let read_dir_depth = depth;
-                let read_dir_contents_depth = depth + 1;
+                // saturating_add 防止 depth=usize::MAX 时溢出
+                let read_dir_contents_depth = depth.saturating_add(1);
 
                 if read_dir_contents_depth > max_depth {
                     return Ok(ReadDir::new(client_read_state, Vec::new()));
@@ -493,305 +494,41 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                     follow_link_ancestors
                 };
 
-                // ── Windows NT Native API fast path ──
                 #[cfg(windows)]
                 {
-                    use crate::core::{enumerate_dir, enumerate_dir_streaming, DirEntryInfo};
-
-                    // Windows FILETIME epoch (1601-01-01) to UNIX epoch offset in 100ns ticks
-                    const EPOCH_DIFFERENCE_100NS: i64 = 116_444_736_000_000_000;
-                    /// 100-ns ticks per second (FILETIME precision)
-                    const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
-                    /// Nanoseconds per 100-ns tick
-                    const NS_PER_HUNDRED_NS: i64 = 100;
-
-                    /// 将 Windows FILETIME (100-ns ticks since 1601) 转为 SystemTime
-                    fn filetime_to_systemtime(ft: i64) -> Option<std::time::SystemTime> {
-                        if ft == 0 { return None; }
-                        let duration_100ns = ft.saturating_sub(EPOCH_DIFFERENCE_100NS);
-                        if duration_100ns < 0 { return None; }
-                        let secs = (duration_100ns / HUNDRED_NS_PER_SEC) as u64;
-                        let nanos = ((duration_100ns % HUNDRED_NS_PER_SEC) * NS_PER_HUNDRED_NS) as u32;
-                        Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
-                    }
-
-                    /// 从 file_attributes (u32) 构造 std::fs::FileType
-                    ///
-                    /// SAFETY: 此 transmute 依赖 std::fs::FileType 的内部布局。
-                    /// 在 Windows 上 FileType 内部存储为 `[bool; 2]`（is_dir, is_symlink），
-                    /// 实际以 `u16` 表示：byte 0 = is_dir, byte 1 = is_symlink。
-                    ///
-                    /// 注意：std 并未保证此布局稳定。如果 Rust 标准库未来更改 FileType
-                    /// 的内部表示，此 transmute 将产生未定义行为。更安全的替代方案是
-                    /// 使用 `From<u32>` 或 `FromRawOs` 等 API（当稳定后）。
-                    ///
-                    /// 依赖的布局定义位于（Rust 1.x）：
-                    /// `library/std/src/sys/pal/windows/fs.rs: FileType { is_directory: bool, is_symlink: bool }`
-                    fn file_type_from_attrs(attrs: u32) -> std::fs::FileType {
-                        let is_dir = (attrs & 0x10) != 0;  // FILE_ATTRIBUTE_DIRECTORY
-                        let is_sym = (attrs & 0x400) != 0;  // FILE_ATTRIBUTE_REPARSE_POINT
-                        let bits: u16 = (is_dir as u16) | ((is_sym as u16) << 8);
-                        unsafe { std::mem::transmute(bits) }
-                    }
-
-                    /// 从 DirEntryInfo 构造 MetaData
-                    fn make_metadata(info: &DirEntryInfo) -> MetaData {
-                        let ft = file_type_from_attrs(info.file_attributes);
-                        MetaData {
-                            is_dir: ft.is_dir(),
-                            is_file: ft.is_file(),
-                            is_symlink: ft.is_symlink(),
-                            size: info.file_size,
-                            created: filetime_to_systemtime(info.creation_time),
-                            modified: filetime_to_systemtime(info.last_write_time),
-                            accessed: filetime_to_systemtime(info.last_access_time),
-                            permissions: None, // NT fast path 不获取权限信息
-                        }
-                    }
-
-                    /// 从 DirEntryInfo 构造 MetaDataExt
-                    fn make_metadata_ext(info: &DirEntryInfo) -> MetaDataExt {
-                        MetaDataExt {
-                            file_attributes: info.file_attributes,
-                            volume_serial_number: None,
-                            number_of_links: None,
-                            file_index: Some(info.file_id),
-                        }
-                    }
-
-                    /// 从 DirEntryInfo 构造 DirEntry
-                    fn make_dir_entry<C: ClientState>(
-                        info: &DirEntryInfo,
-                        depth: usize,
-                        parent_path: Arc<Path>,
-                        read_metadata: bool,
-                        read_metadata_ext: bool,
-                        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
-                    ) -> Result<DirEntry<C>> {
-                        let entry_metadata = if read_metadata {
-                            Some(make_metadata(info))
-                        } else {
-                            None
-                        };
-                        let entry_metadata_ext = if read_metadata_ext {
-                            Some(make_metadata_ext(info))
-                        } else {
-                            None
-                        };
-                        let file_type = file_type_from_attrs(info.file_attributes);
-                        DirEntry::from_raw(
-                            depth,
-                            parent_path,
-                            entry_metadata,
-                            entry_metadata_ext,
-                            info.file_name.clone(),
-                            file_type,
-                            follow_link_ancestors,
-                        )
-                    }
-
-                    // 选择枚举策略：流式 vs 非流式
-                    let use_streaming = streaming_ctx.is_some() && !sort;
-
-                    // Cell<usize> 允许闭包内修改，不受 Copy 语义影响
-                    let streamed_count = std::cell::Cell::new(0usize);
-
-                    let entries_result = if use_streaming {
-                        // ── 流式分发路径 ──
-                        // 准备 IndexPath：克隆基路径并 push(0)，回调中递增最后一个元素
-                        let mut child_index_path = streaming_ctx.as_ref().unwrap().index_path.clone();
-                        child_index_path.indices.push(0);
-
-                        let ctx = streaming_ctx.as_ref().unwrap();
-
-                        // 优先淹没算法：weight = parent_weight + subdir_count
-                        // parent_weight 继承父目录权重（大管道的分支也是大管道）
-                        // subdir_count 递增确保子目录越多的父目录权重越高
-                        let parent_weight = ctx.parent_weight;
-
-                        enumerate_dir_streaming(path.as_ref(), dir_entry_capacity, |dir_info| {
-                            // 跳过隐藏目录
-                            if skip_hidden && is_hidden(&dir_info.file_name) {
-                                return;
-                            }
-
-                            // FILE_ATTRIBUTE_DIRECTORY = 0x10
-                            if dir_info.file_attributes & 0x10 == 0 {
-                                return; // 只分发子目录
-                            }
-
-                            let child_path: Arc<Path> = Arc::from(
-                                path.join(&dir_info.file_name)
-                            );
-                            let spec = ReadDirSpec {
-                                depth: read_dir_contents_depth,
-                                path: child_path,
-                                client_read_state: client_read_state.clone(),
-                                follow_link_ancestors: follow_link_ancestors.clone(),
-                            };
-
-                        // 优先淹没算法：统一权重策略
-                        // 流式路径：weight = parent_weight + (streamed_count + 1)
-                        // 非流式路径(read_dir.rs)：weight = parent_weight + pipe_size
-                        //
-                        // 流式阶段 pipe_size 尚不可知（枚举未完成），
-                        // 使用 streamed_count+1 作为递增权重下界，
-                        // 确保先发现的子目录先被调度（BFS倾向）。
-                        // 枚举完成后非流式部分使用完整 pipe_size 统一权重。
-                        let weight = parent_weight.saturating_add(streamed_count.get() + 1);
-                            *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
-                            ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight));
-                            streamed_count.set(streamed_count.get() + 1);
-                        })
-                    } else {
-                        // ── 非流式路径 ──
-                        enumerate_dir(path.as_ref(), dir_entry_capacity)
-                    };
-
-                    let streamed_child_count = streamed_count.get();
-
-                    let entries = match entries_result {
-                        Ok(e) => e,
-                        Err(err) => {
-                            return Err(Error::from_path(0, path.to_path_buf(), err));
-                        }
-                    };
-
-                    // 构造 DirEntry 列表
-                    let mut dir_entry_results: Vec<_> = entries
-                        .iter()
-                        .filter_map(|info| {
-                            if skip_hidden && is_hidden(&info.file_name) {
-                                return None;
-                            }
-
-                            let dir_entry = match make_dir_entry(
-                                info,
-                                read_dir_contents_depth,
-                                path.clone(),
-                                read_metadata,
-                                read_metadata_ext,
-                                follow_link_ancestors.clone(),
-                            ) {
-                                Ok(e) => e,
-                                Err(err) => return Some(Err(err)),
-                            };
-
-                            Some(process_dir_entry_result(Ok(dir_entry), follow_links))
-                        })
-                        .collect();
-
-                    if sort {
-                        dir_entry_results.sort_unstable_by(|a, b| match (a, b) {
-                            (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
-                            (Ok(_), Err(_)) => Ordering::Less,
-                            (Err(_), Ok(_)) => Ordering::Greater,
-                            (Err(_), Err(_)) => Ordering::Equal,
-                        });
-                    }
-
-                    if let Some(process_read_dir) = process_read_dir.as_ref() {
-                        process_read_dir(
-                            Some(read_dir_depth),
-                            path.as_ref(),
-                            &mut client_read_state,
-                            &mut dir_entry_results,
-                        );
-                    }
-
-                    let mut read_dir = ReadDir::new(client_read_state, dir_entry_results);
-                    read_dir.streamed_child_count = streamed_child_count;
-                    return Ok(read_dir);
+                    read_dir_windows(
+                        path,
+                        read_dir_depth,
+                        read_dir_contents_depth,
+                        follow_links,
+                        read_metadata,
+                        read_metadata_ext,
+                        dir_entry_capacity,
+                        skip_hidden,
+                        sort,
+                        follow_link_ancestors,
+                        client_read_state,
+                        process_read_dir.as_ref(),
+                        streaming_ctx,
+                    )
                 }
-
-                // ── 非 Windows 路径 (fs::read_dir) ──
-                #[cfg(not(windows))]
-                let _ = streaming_ctx; // 消除 unused 警告
 
                 #[cfg(not(windows))]
                 {
-                    let mut dir_entry_results: Vec<_> = fs::read_dir(path.as_ref())
-                        .map_err(|err| Error::from_path(0, path.to_path_buf(), err))?
-                        .filter_map(|dir_entry_result| {
-                            let fs_dir_entry = match dir_entry_result {
-                                Ok(fs_dir_entry) => fs_dir_entry,
-                                Err(err) => {
-                                    return Some(Err(Error::from_io(read_dir_contents_depth, err)))
-                                }
-                            };
-
-                            let mut entry_metadata = None;
-                            let mut entry_metadata_ext = None;
-                            if read_metadata {
-                                if let Ok(metadata) = fs_dir_entry.metadata() {
-                                    entry_metadata = Some(MetaData {
-                                        is_dir: metadata.is_dir(),
-                                        is_file: metadata.is_file(),
-                                        is_symlink: metadata.is_symlink(),
-                                        size: metadata.len(),
-                                        created: metadata.created().ok(),
-                                        modified: metadata.modified().ok(),
-                                        accessed: metadata.accessed().ok(),
-                                        permissions: Some(metadata.permissions()),
-                                    });
-                                } else if let Ok(file_type) = fs_dir_entry.file_type() {
-                                    entry_metadata = Some(MetaData {
-                                        is_dir: file_type.is_dir(),
-                                        is_file: file_type.is_file(),
-                                        is_symlink: file_type.is_symlink(),
-                                        size: 0,
-                                        created: None,
-                                        modified: None,
-                                        accessed: None,
-                                        permissions: None,
-                                    });
-                                }
-                                if read_metadata_ext {
-                                    if let Ok(metadata) = fs::metadata(fs_dir_entry.path()) {
-                                        entry_metadata_ext = Some(get_metadata_ext(&metadata));
-                                    }
-                                }
-                            }
-
-                            let dir_entry = match DirEntry::from_entry(
-                                read_dir_contents_depth,
-                                path.clone(),
-                                entry_metadata,
-                                entry_metadata_ext,
-                                &fs_dir_entry,
-                                follow_link_ancestors.clone(),
-                            ) {
-                                Ok(dir_entry) => dir_entry,
-                                Err(err) => return Some(Err(err)),
-                            };
-
-                            if skip_hidden && is_hidden(&dir_entry.file_name) {
-                                return None;
-                            }
-
-                            Some(process_dir_entry_result(Ok(dir_entry), follow_links))
-                        })
-                        .collect();
-
-                    if sort {
-                        dir_entry_results.sort_unstable_by(|a, b| match (a, b) {
-                            (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
-                            (Ok(_), Err(_)) => Ordering::Less,
-                            (Err(_), Ok(_)) => Ordering::Greater,
-                            (Err(_), Err(_)) => Ordering::Equal,
-                        });
-                    }
-
-                    if let Some(process_read_dir) = process_read_dir.as_ref() {
-                        process_read_dir(
-                            Some(read_dir_depth),
-                            path.as_ref(),
-                            &mut client_read_state,
-                            &mut dir_entry_results,
-                        );
-                    }
-
-                    Ok(ReadDir::new(client_read_state, dir_entry_results))
+                    let _ = streaming_ctx; // 消除 unused 警告
+                    read_dir_unix(
+                        path,
+                        read_dir_depth,
+                        read_dir_contents_depth,
+                        follow_links,
+                        read_metadata,
+                        read_metadata_ext,
+                        skip_hidden,
+                        sort,
+                        follow_link_ancestors,
+                        client_read_state,
+                        process_read_dir.as_ref(),
+                    )
                 }
             }),
         )
@@ -862,6 +599,132 @@ fn is_hidden(file_name: &OsStr) -> bool {
         .unwrap_or(false)
 }
 
+/// Windows 文件属性常量
+#[cfg(windows)]
+mod win32_attrs {
+    /// 目录属性位
+    pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    /// 符号链接/重解析点属性位
+    pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    /// 隐藏文件属性位
+    pub const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+}
+
+/// Windows 扩展版 is_hidden：同时检查 dot 前缀和 FILE_ATTRIBUTE_HIDDEN 属性位。
+#[cfg(windows)]
+fn is_hidden_win32(file_name: &OsStr, file_attributes: u32) -> bool {
+    if file_attributes & win32_attrs::FILE_ATTRIBUTE_HIDDEN != 0 {
+        return true;
+    }
+    is_hidden(file_name)
+}
+
+// ── Windows NT fast-path 辅助函数 ─────────────────────────────────────
+
+#[cfg(windows)]
+mod read_dir_windows_helpers {
+    use super::*;
+    use crate::core::DirEntryInfo;
+
+    // Windows FILETIME epoch (1601-01-01) to UNIX epoch offset in 100ns ticks
+    pub(super) const EPOCH_DIFFERENCE_100NS: i64 = 116_444_736_000_000_000;
+    /// 100-ns ticks per second (FILETIME precision)
+    pub(super) const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
+    /// Nanoseconds per 100-ns tick
+    pub(super) const NS_PER_HUNDRED_NS: i64 = 100;
+
+    /// 将 Windows FILETIME (100-ns ticks since 1601) 转为 SystemTime
+    pub(super) fn filetime_to_systemtime(ft: i64) -> Option<std::time::SystemTime> {
+        if ft == 0 { return None; }
+        let duration_100ns = ft.saturating_sub(EPOCH_DIFFERENCE_100NS);
+        if duration_100ns < 0 { return None; }
+        let secs = (duration_100ns / HUNDRED_NS_PER_SEC) as u64;
+        let nanos = ((duration_100ns % HUNDRED_NS_PER_SEC) * NS_PER_HUNDRED_NS) as u32;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+    }
+
+    /// 从 file_attributes (u32) 构造 std::fs::FileType
+    ///
+    /// SAFETY: 此 transmute 依赖 std::fs::FileType 的内部布局。
+    /// 在 Windows 上 FileType 内部存储为 `[bool; 2]`（is_dir, is_symlink），
+    /// 实际以 `u16` 表示：byte 0 = is_dir, byte 1 = is_symlink。
+    ///
+    /// 注意：std 并未保证此布局稳定。如果 Rust 标准库未来更改 FileType
+    /// 的内部表示，此 transmute 将产生未定义行为。更安全的替代方案是
+    /// 使用 `From<u32>` 或 `FromRawOs` 等 API（当稳定后）。
+    ///
+    /// 依赖的布局定义位于（Rust 1.x）：
+    /// `library/std/src/sys/pal/windows/fs.rs: FileType { is_directory: bool, is_symlink: bool }`
+    pub(super) fn file_type_from_attrs(attrs: u32) -> std::fs::FileType {
+        // 运行时校验：确保 u16 与 FileType 大小一致，
+        // 防止 std 更改布局后静默 UB
+        const _: () = assert!(
+            std::mem::size_of::<std::fs::FileType>() == std::mem::size_of::<u16>(),
+            "FileType layout assumption violated: expected 2 bytes"
+        );
+        let is_dir = (attrs & win32_attrs::FILE_ATTRIBUTE_DIRECTORY) != 0;
+        let is_sym = (attrs & win32_attrs::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        let bits: u16 = (is_dir as u16) | ((is_sym as u16) << 8);
+        unsafe { std::mem::transmute(bits) }
+    }
+
+    /// 从 DirEntryInfo 构造 MetaData
+    pub(super) fn make_metadata(info: &DirEntryInfo) -> MetaData {
+        let ft = file_type_from_attrs(info.file_attributes);
+        MetaData {
+            is_dir: ft.is_dir(),
+            is_file: ft.is_file(),
+            is_symlink: ft.is_symlink(),
+            size: info.file_size,
+            created: filetime_to_systemtime(info.creation_time),
+            modified: filetime_to_systemtime(info.last_write_time),
+            accessed: filetime_to_systemtime(info.last_access_time),
+            permissions: None, // NT fast path 不获取权限信息
+        }
+    }
+
+    /// 从 DirEntryInfo 构造 MetaDataExt
+    pub(super) fn make_metadata_ext(info: &DirEntryInfo) -> MetaDataExt {
+        MetaDataExt {
+            file_attributes: info.file_attributes,
+            volume_serial_number: None,
+            number_of_links: None,
+            file_index: Some(info.file_id),
+        }
+    }
+
+    /// 从 DirEntryInfo 构造 DirEntry
+    pub(super) fn make_dir_entry<C: ClientState>(
+        info: &DirEntryInfo,
+        depth: usize,
+        parent_path: Arc<Path>,
+        read_metadata: bool,
+        read_metadata_ext: bool,
+        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    ) -> Result<DirEntry<C>> {
+        let entry_metadata = if read_metadata {
+            Some(make_metadata(info))
+        } else {
+            None
+        };
+        let entry_metadata_ext = if read_metadata_ext {
+            Some(make_metadata_ext(info))
+        } else {
+            None
+        };
+        let file_type = file_type_from_attrs(info.file_attributes);
+        DirEntry::from_raw(
+            depth,
+            parent_path,
+            entry_metadata,
+            entry_metadata_ext,
+            info.file_name.clone(),
+            file_type,
+            follow_link_ancestors,
+        )
+    }
+}
+
 impl<B, E> ClientState for (B, E)
 where
     B: Clone + Send + Default + Debug + 'static,
@@ -869,4 +732,241 @@ where
 {
     type ReadDirState = B;
     type DirEntryState = E;
+}
+
+// ── 平台特定的 read_dir 实现 ─────────────────────────────────────────
+
+/// Windows NT Native API fast path：使用 NtQueryDirectoryFileEx 枚举目录。
+///
+/// 支持流式子目录分发（streaming）和常规批量枚举两种模式。
+#[cfg(windows)]
+fn read_dir_windows<C: ClientState>(
+    path: Arc<Path>,
+    read_dir_depth: usize,
+    read_dir_contents_depth: usize,
+    follow_links: bool,
+    read_metadata: bool,
+    read_metadata_ext: bool,
+    dir_entry_capacity: usize,
+    skip_hidden: bool,
+    sort: bool,
+    follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    mut client_read_state: C::ReadDirState,
+    process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
+    streaming_ctx: Option<crate::core::StreamingContext<C>>,
+) -> Result<ReadDir<C>> {
+    use crate::core::{enumerate_dir, enumerate_dir_streaming};
+    use read_dir_windows_helpers::*;
+
+    // 选择枚举策略：流式 vs 非流式
+    let use_streaming = streaming_ctx.is_some() && !sort;
+
+    // Cell<usize> 允许闭包内修改，不受 Copy 语义影响
+    let streamed_count = std::cell::Cell::new(0usize);
+
+    let entries_result = if use_streaming {
+        // ── 流式分发路径 ──
+        // 准备 IndexPath：克隆基路径并 push(0)，回调中递增最后一个元素
+        let mut child_index_path = streaming_ctx.as_ref().unwrap().index_path.clone();
+        child_index_path.indices.push(0);
+
+        let ctx = streaming_ctx.as_ref().unwrap();
+
+        // 优先淹没算法：weight = parent_weight + subdir_count
+        // parent_weight 继承父目录权重（大管道的分支也是大管道）
+        // subdir_count 递增确保子目录越多的父目录权重越高
+        let parent_weight = ctx.parent_weight;
+
+        enumerate_dir_streaming(path.as_ref(), dir_entry_capacity, |dir_info| {
+            // 跳过隐藏目录
+            if skip_hidden && is_hidden_win32(&dir_info.file_name, dir_info.file_attributes) {
+                return;
+            }
+
+            // 检查是否为目录
+            if dir_info.file_attributes & win32_attrs::FILE_ATTRIBUTE_DIRECTORY == 0 {
+                return; // 只分发子目录
+            }
+
+            let child_path: Arc<Path> = Arc::from(
+                path.join(&dir_info.file_name)
+            );
+            let spec = ReadDirSpec {
+                depth: read_dir_contents_depth,
+                path: child_path,
+                client_read_state: client_read_state.clone(),
+                follow_link_ancestors: follow_link_ancestors.clone(),
+            };
+
+        // 优先淹没算法：统一权重策略
+        // 流式路径：weight = parent_weight + (streamed_count + 1)
+        // 非流式路径(read_dir.rs)：weight = parent_weight + pipe_size
+        //
+        // 流式阶段 pipe_size 尚不可知（枚举未完成），
+        // 使用 streamed_count+1 作为递增权重下界，
+        // 确保先发现的子目录先被调度（BFS倾向）。
+        // 枚举完成后非流式部分使用完整 pipe_size 统一权重。
+        let weight = parent_weight.saturating_add(streamed_count.get() + 1);
+            *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
+            ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight));
+            streamed_count.set(streamed_count.get() + 1);
+        })
+    } else {
+        // ── 非流式路径 ──
+        enumerate_dir(path.as_ref(), dir_entry_capacity)
+    };
+
+    let streamed_child_count = streamed_count.get();
+
+    let entries = match entries_result {
+        Ok(e) => e,
+        Err(err) => {
+            return Err(Error::from_path(0, path.to_path_buf(), err));
+        }
+    };
+
+    // 构造 DirEntry 列表
+    let mut dir_entry_results: Vec<_> = entries
+        .iter()
+        .filter_map(|info| {
+            if skip_hidden && is_hidden_win32(&info.file_name, info.file_attributes) {
+                return None;
+            }
+
+            let dir_entry = match make_dir_entry(
+                info,
+                read_dir_contents_depth,
+                path.clone(),
+                read_metadata,
+                read_metadata_ext,
+                follow_link_ancestors.clone(),
+            ) {
+                Ok(e) => e,
+                Err(err) => return Some(Err(err)),
+            };
+
+            Some(process_dir_entry_result(Ok(dir_entry), follow_links))
+        })
+        .collect();
+
+    if sort {
+        dir_entry_results.sort_unstable_by(|a, b| match (a, b) {
+            (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => Ordering::Equal,
+        });
+    }
+
+    if let Some(process_read_dir) = process_read_dir {
+        process_read_dir(
+            Some(read_dir_depth),
+            path.as_ref(),
+            &mut client_read_state,
+            &mut dir_entry_results,
+        );
+    }
+
+    let mut read_dir = ReadDir::new(client_read_state, dir_entry_results);
+    read_dir.streamed_child_count = streamed_child_count;
+    Ok(read_dir)
+}
+
+/// 非 Windows 路径：使用 fs::read_dir 枚举目录。
+#[cfg(not(windows))]
+fn read_dir_unix<C: ClientState>(
+    path: Arc<Path>,
+    read_dir_depth: usize,
+    read_dir_contents_depth: usize,
+    follow_links: bool,
+    read_metadata: bool,
+    read_metadata_ext: bool,
+    skip_hidden: bool,
+    sort: bool,
+    follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    mut client_read_state: C::ReadDirState,
+    process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
+) -> Result<ReadDir<C>> {
+    let mut dir_entry_results: Vec<_> = fs::read_dir(path.as_ref())
+        .map_err(|err| Error::from_path(0, path.to_path_buf(), err))?
+        .filter_map(|dir_entry_result| {
+            let fs_dir_entry = match dir_entry_result {
+                Ok(fs_dir_entry) => fs_dir_entry,
+                Err(err) => {
+                    return Some(Err(Error::from_io(read_dir_contents_depth, err)))
+                }
+            };
+
+            let mut entry_metadata = None;
+            let mut entry_metadata_ext = None;
+            if read_metadata {
+                if let Ok(metadata) = fs_dir_entry.metadata() {
+                    entry_metadata = Some(MetaData {
+                        is_dir: metadata.is_dir(),
+                        is_file: metadata.is_file(),
+                        is_symlink: metadata.is_symlink(),
+                        size: metadata.len(),
+                        created: metadata.created().ok(),
+                        modified: metadata.modified().ok(),
+                        accessed: metadata.accessed().ok(),
+                        permissions: Some(metadata.permissions()),
+                    });
+                } else if let Ok(file_type) = fs_dir_entry.file_type() {
+                    entry_metadata = Some(MetaData {
+                        is_dir: file_type.is_dir(),
+                        is_file: file_type.is_file(),
+                        is_symlink: file_type.is_symlink(),
+                        size: 0,
+                        created: None,
+                        modified: None,
+                        accessed: None,
+                        permissions: None,
+                    });
+                }
+                if read_metadata_ext {
+                    if let Ok(metadata) = fs::metadata(fs_dir_entry.path()) {
+                        entry_metadata_ext = Some(get_metadata_ext(&metadata));
+                    }
+                }
+            }
+
+            let dir_entry = match DirEntry::from_entry(
+                read_dir_contents_depth,
+                path.clone(),
+                entry_metadata,
+                entry_metadata_ext,
+                &fs_dir_entry,
+                follow_link_ancestors.clone(),
+            ) {
+                Ok(dir_entry) => dir_entry,
+                Err(err) => return Some(Err(err)),
+            };
+
+            if skip_hidden && is_hidden(&dir_entry.file_name) {
+                return None;
+            }
+
+            Some(process_dir_entry_result(Ok(dir_entry), follow_links))
+        })
+        .collect();
+
+    if sort {
+        dir_entry_results.sort_unstable_by(|a, b| match (a, b) {
+            (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => Ordering::Equal,
+        });
+    }
+
+    if let Some(process_read_dir) = process_read_dir {
+        process_read_dir(
+            Some(read_dir_depth),
+            path.as_ref(),
+            &mut client_read_state,
+            &mut dir_entry_results,
+        );
+    }
+
+    Ok(ReadDir::new(client_read_state, dir_entry_results))
 }
