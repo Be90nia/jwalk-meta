@@ -31,7 +31,6 @@ impl<C: ClientState> RunContext<C> {
 
     pub(crate) fn complete_item(&self) {
         self.read_dir_spec_queue.complete_item();
-        self.read_dir_result_queue.complete_item();
     }
 }
 
