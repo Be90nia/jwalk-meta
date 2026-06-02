@@ -762,7 +762,7 @@ fn read_dir_windows<C: ClientState>(
     use read_dir_windows_helpers::*;
 
     // 选择枚举策略：流式 vs 非流式
-    let use_streaming = streaming_ctx.is_some() && !sort;
+    let use_streaming = streaming_ctx.is_some() && !sort && process_read_dir.is_none();
 
     // Cell<usize> 允许闭包内修改，不受 Copy 语义影响
     let streamed_count = std::cell::Cell::new(0usize);
@@ -781,6 +781,11 @@ fn read_dir_windows<C: ClientState>(
         let parent_weight = ctx.parent_weight;
 
         enumerate_dir_streaming(path.as_ref(), dir_entry_capacity, |dir_info| {
+            // 检查停止标志 — 如果遍历被取消则立即退出
+            if ctx.is_stopped() {
+                return;
+            }
+
             // 跳过隐藏目录
             if skip_hidden && is_hidden_win32(&dir_info.file_name, dir_info.file_attributes) {
                 return;
@@ -827,6 +832,14 @@ fn read_dir_windows<C: ClientState>(
     let entries = match entries_result {
         Ok(e) => e,
         Err(err) => {
+            // 如果流式枚举在出错前已调度了子目录，必须报告已调度数量，
+            // 否则 OrderedQueue 的 pending_count 会不匹配，导致消费者永远挂起。
+            // 返回包含错误 DirEntry 的 ReadDir，携带正确的 streamed_child_count。
+            if streamed_child_count > 0 {
+                let mut read_dir = ReadDir::new(client_read_state, vec![Some(Err(Error::from_path(0, path.to_path_buf(), err)))]);
+                read_dir.streamed_child_count = streamed_child_count;
+                return Ok(read_dir);
+            }
             return Err(Error::from_path(0, path.to_path_buf(), err));
         }
     };

@@ -50,6 +50,8 @@ struct OrderedMatcher {
 /// Bounded channel 容量：限制内存使用，同时提供足够缓冲避免频繁阻塞。
 const CHANNEL_CAPACITY: usize = 1024;
 
+const MAX_RECEIVE_BUFFER_SIZE: usize = 4096;
+
 pub(crate) fn new_ordered_queue<T>(
     stop: Arc<AtomicBool>,
     ordering: Ordering,
@@ -121,8 +123,12 @@ where
 
     /// 批量 drain channel 中所有就绪元素到 receive_buffer。
     fn drain_channel(&mut self) {
-        while let Ok(ordered) = self.receiver.try_recv() {
-            self.receive_buffer.push(ordered);
+        while self.receive_buffer.len() < MAX_RECEIVE_BUFFER_SIZE {
+            if let Ok(ordered) = self.receiver.try_recv() {
+                self.receive_buffer.push(ordered);
+            } else {
+                break;
+            }
         }
     }
 
@@ -260,7 +266,10 @@ where
             };
             match try_next {
                 Ok(next) => {
-                    self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
+                    let prev = self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
+                    if prev == 0 {
+                        self.pending_count.fetch_add(1, AtomicOrdering::AcqRel);
+                    }
                     return Some(next);
                 }
                 Err(err) => match err {

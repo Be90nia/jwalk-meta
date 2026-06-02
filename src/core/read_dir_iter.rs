@@ -39,6 +39,11 @@ impl<C: ClientState> StreamingContext<C> {
     pub(crate) fn schedule(&self, weighted: Weighted<ReadDirSpec<C>>) -> bool {
         self.run_context.schedule_read_dir_spec(weighted)
     }
+
+    /// 检查遍历是否已被停止（close() 调用）。
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.run_context.stop.load(AtomicOrdering::Acquire)
+    }
 }
 
 /// Result<ReadDir> Iterator.
@@ -166,65 +171,68 @@ fn multi_threaded_walk_dir<C: ClientState>(
     weighted_read_dir_spec: Weighted<ReadDirSpec<C>>,
     run_context: &mut RunContext<C>,
 ) {
-    let Weighted {
-        value: read_dir_spec,
-        index_path,
-        weight: parent_weight,
-    } = weighted_read_dir_spec;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    // 创建流式分发上下文，传递父权重用于优先淹没算法的权重继承
-    let streaming_ctx = StreamingContext::new(index_path.clone(), run_context.clone(), parent_weight);
+    if run_context.stop.load(AtomicOrdering::Acquire) {
+        run_context.read_dir_spec_queue.complete_item();
+        return;
+    }
 
-    let read_dir_result = (run_context.core_read_dir_callback)(read_dir_spec, Some(streaming_ctx));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Weighted {
+            value: read_dir_spec,
+            index_path,
+            weight: parent_weight,
+        } = weighted_read_dir_spec;
 
-    // 流式分发后：已通过 streaming callback 调度的子目录不需要再次调度
-    // 只需调度 results_list 中非流式部分的子目录
-    let schedule_regular = read_dir_result.as_ref().map_or(false, |read_dir| {
-        read_dir.streamed_child_count == 0
-    });
+        let streaming_ctx = StreamingContext::new(index_path.clone(), run_context.clone(), parent_weight);
 
-    let weighted_children_specs = if schedule_regular {
-        read_dir_result
-            .as_ref()
-            .ok()
-            .map(|read_dir| read_dir.weighted_children_specs(&index_path, parent_weight))
-    } else {
-        None
-    };
+        let read_dir_result = (run_context.core_read_dir_callback)(read_dir_spec, Some(streaming_ctx));
 
-    // child_count = 流式已调度数 + 常规调度数
-    let streamed_count = read_dir_result.as_ref().map_or(0, |rd| rd.streamed_child_count);
-    let regular_count = weighted_children_specs.as_ref().map_or(0, Vec::len);
-    let child_count = streamed_count + regular_count;
+        let schedule_regular = read_dir_result.as_ref().map_or(false, |read_dir| {
+            read_dir.streamed_child_count == 0
+        });
 
-    // 发送结果到 OrderedQueue
-    let ordered_read_dir_result = Ordered::new(
-        read_dir_result,
-        index_path.clone(),
-        child_count,
-    );
+        let weighted_children_specs = if schedule_regular {
+            read_dir_result
+                .as_ref()
+                .ok()
+                .map(|read_dir| read_dir.weighted_children_specs(&index_path, parent_weight))
+        } else {
+            None
+        };
 
-    let send_ok = run_context.send_read_dir_result(ordered_read_dir_result);
+        let streamed_count = read_dir_result.as_ref().map_or(0, |rd| rd.streamed_child_count);
+        let regular_count = weighted_children_specs.as_ref().map_or(0, Vec::len);
+        let child_count = streamed_count + regular_count;
 
-    if send_ok {
-        // 仅在结果成功入队时调度子目录
-        if let Some(weighted_children_specs) = weighted_children_specs {
-            for each in weighted_children_specs {
-                // 调度失败说明 channel 已关闭（用户 drop 了迭代器），
-                // 立即停止调度剩余子目录
-                if !run_context.schedule_read_dir_spec(each) {
-                    break;
+        let ordered_read_dir_result = Ordered::new(
+            read_dir_result,
+            index_path.clone(),
+            child_count,
+        );
+
+        let send_ok = run_context.send_read_dir_result(ordered_read_dir_result);
+
+        if send_ok {
+            if let Some(weighted_children_specs) = weighted_children_specs {
+                for each in weighted_children_specs {
+                    if !run_context.schedule_read_dir_spec(each) {
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    // send_ok=false 时 result 未入队，只需递减 spec_queue 的 count
-    // send_ok=true 时 result 已入队，两个 queue 的 count 都需要递减
-    if send_ok {
-        run_context.complete_item();
-    } else {
-        // 结果未入队，但 spec 已消耗：仅递减 spec_queue 的 pending count
+        if send_ok {
+            run_context.complete_item();
+        } else {
+            run_context.read_dir_spec_queue.complete_item();
+        }
+    }));
+
+    if let Err(panic_payload) = result {
         run_context.read_dir_spec_queue.complete_item();
+        std::panic::resume_unwind(panic_payload);
     }
 }
