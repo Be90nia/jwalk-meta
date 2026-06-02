@@ -214,8 +214,10 @@ fn parse_buffer_entries(
         // 且 bytes_returned 保证 offset < bytes_returned <= buffer.len()
         let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
         // SAFETY: entry_ptr 指向 buffer 中有效的 FILE_ID_BOTH_DIR_INFO 数据。
-        // 结构体对齐由 NT API 保证（4 字节对齐）。
-        let entry = unsafe { &*(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
+        // NT API 返回的 FILE_ID_BOTH_DIR_INFO 可能未对齐到结构体的自然对齐要求
+        // （只保证 4 字节对齐，但结构体含 u64 字段需要 8 字节对齐）。
+        // 使用 read_unaligned 避免未定义行为。
+        let entry = unsafe { std::ptr::read_unaligned(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
 
         let name_len = entry.FileNameLength as usize;
         let name_chars = name_len / 2;
@@ -238,7 +240,7 @@ fn parse_buffer_entries(
             };
             let file_name = OsString::from_wide(name_slice);
 
-            on_entry(entry, &file_name);
+            on_entry(&entry, &file_name);
         }
 
         let next_offset = entry.NextEntryOffset;
