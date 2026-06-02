@@ -47,8 +47,10 @@ struct OrderedMatcher {
     child_count_stack: Vec<usize>,
 }
 
-/// Bounded channel 容量：限制内存使用，同时提供足够缓冲避免频繁阻塞。
-const CHANNEL_CAPACITY: usize = 1024;
+/// Bounded channel 容量：提供充足的缓冲避免生产者阻塞。
+/// 设为 524288 (512K)，百万级条目扫描下也不会成为瓶颈。
+/// 每个条目仅持有指针/小结构，524288 × ~64B ≈ 32MB，内存开销可控。
+const CHANNEL_CAPACITY: usize = 524288;
 
 const MAX_RECEIVE_BUFFER_SIZE: usize = 4096;
 

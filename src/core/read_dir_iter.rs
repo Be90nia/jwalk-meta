@@ -171,68 +171,59 @@ fn multi_threaded_walk_dir<C: ClientState>(
     weighted_read_dir_spec: Weighted<ReadDirSpec<C>>,
     run_context: &mut RunContext<C>,
 ) {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
     if run_context.stop.load(AtomicOrdering::Acquire) {
         run_context.read_dir_spec_queue.complete_item();
         return;
     }
 
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let Weighted {
-            value: read_dir_spec,
-            index_path,
-            weight: parent_weight,
-        } = weighted_read_dir_spec;
+    let Weighted {
+        value: read_dir_spec,
+        index_path,
+        weight: parent_weight,
+    } = weighted_read_dir_spec;
 
-        let streaming_ctx = StreamingContext::new(index_path.clone(), run_context.clone(), parent_weight);
+    let streaming_ctx = StreamingContext::new(index_path.clone(), run_context.clone(), parent_weight);
 
-        let read_dir_result = (run_context.core_read_dir_callback)(read_dir_spec, Some(streaming_ctx));
+    let read_dir_result = (run_context.core_read_dir_callback)(read_dir_spec, Some(streaming_ctx));
 
-        let schedule_regular = read_dir_result.as_ref().map_or(false, |read_dir| {
-            read_dir.streamed_child_count == 0
-        });
+    let schedule_regular = read_dir_result.as_ref().map_or(false, |read_dir| {
+        read_dir.streamed_child_count == 0
+    });
 
-        let weighted_children_specs = if schedule_regular {
-            read_dir_result
-                .as_ref()
-                .ok()
-                .map(|read_dir| read_dir.weighted_children_specs(&index_path, parent_weight))
-        } else {
-            None
-        };
+    let weighted_children_specs = if schedule_regular {
+        read_dir_result
+            .as_ref()
+            .ok()
+            .map(|read_dir| read_dir.weighted_children_specs(&index_path, parent_weight))
+    } else {
+        None
+    };
 
-        let streamed_count = read_dir_result.as_ref().map_or(0, |rd| rd.streamed_child_count);
-        let regular_count = weighted_children_specs.as_ref().map_or(0, Vec::len);
-        let child_count = streamed_count + regular_count;
+    let streamed_count = read_dir_result.as_ref().map_or(0, |rd| rd.streamed_child_count);
+    let regular_count = weighted_children_specs.as_ref().map_or(0, Vec::len);
+    let child_count = streamed_count + regular_count;
 
-        let ordered_read_dir_result = Ordered::new(
-            read_dir_result,
-            index_path.clone(),
-            child_count,
-        );
+    let ordered_read_dir_result = Ordered::new(
+        read_dir_result,
+        index_path.clone(),
+        child_count,
+    );
 
-        let send_ok = run_context.send_read_dir_result(ordered_read_dir_result);
+    let send_ok = run_context.send_read_dir_result(ordered_read_dir_result);
 
-        if send_ok {
-            if let Some(weighted_children_specs) = weighted_children_specs {
-                for each in weighted_children_specs {
-                    if !run_context.schedule_read_dir_spec(each) {
-                        break;
-                    }
+    if send_ok {
+        if let Some(weighted_children_specs) = weighted_children_specs {
+            for each in weighted_children_specs {
+                if !run_context.schedule_read_dir_spec(each) {
+                    break;
                 }
             }
         }
+    }
 
-        if send_ok {
-            run_context.complete_item();
-        } else {
-            run_context.read_dir_spec_queue.complete_item();
-        }
-    }));
-
-    if let Err(panic_payload) = result {
+    if send_ok {
+        run_context.complete_item();
+    } else {
         run_context.read_dir_spec_queue.complete_item();
-        std::panic::resume_unwind(panic_payload);
     }
 }

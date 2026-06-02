@@ -1,6 +1,6 @@
 //! Priority queue backed by a channel and BinaryHeap.
 
-use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError, TrySendError};
+use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError};
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -25,9 +25,10 @@ where
     pending_count: Arc<AtomicUsize>,
 }
 
-/// Bounded channel 容量：限制内存使用，同时提供足够缓冲避免频繁阻塞。
-/// 设为 1024，约等于 rayon 默认线程数 × 128，平衡吞吐与内存。
-const CHANNEL_CAPACITY: usize = 1024;
+/// Bounded channel 容量：提供充足的缓冲避免生产者阻塞。
+/// 设为 524288 (512K)，百万级条目扫描下也不会成为瓶颈。
+/// 每个条目仅持有指针/小结构，524288 × ~64B ≈ 32MB，内存开销可控。
+const CHANNEL_CAPACITY: usize = 524288;
 
 /// BinaryHeap 初始容量：256 是经验值，平衡初始内存占用和重新分配次数。
 /// 普通目录子项数通常 < 256，避免首次扩展。
@@ -60,19 +61,15 @@ impl<T> PriorityQueue<T>
 where
     T: Send,
 {
-    /// 非阻塞 push：使用 try_send 避免在 channel 满时阻塞调用线程。
-    /// 在 streaming 模式下，调用方可能处于 I/O 回调中持有目录句柄，
-    /// 阻塞会导致后续条目无法读取（jwalk-meta-1vo）。
+    /// 阻塞 push：使用 send 确保子目录调度不丢失。
+    /// channel 容量已设为 524288，实际场景中几乎不会阻塞。
+    /// 之前用 try_send 在 channel 满时丢弃调度，导致目录分支被跳过、并行度下降。
     pub fn push(&self, weighted: Weighted<T>) -> Result<(), SendError<Weighted<T>>> {
-        let result = self.sender.try_send(weighted);
-        match result {
-            Ok(()) => {
-                self.pending_count.fetch_add(1, AtomicOrdering::Release);
-                Ok(())
-            }
-            Err(TrySendError::Full(val)) => Err(SendError(val)),
-            Err(TrySendError::Disconnected(val)) => Err(SendError(val)),
+        let result = self.sender.send(weighted);
+        if result.is_ok() {
+            self.pending_count.fetch_add(1, AtomicOrdering::Release);
         }
+        result
     }
 
     pub fn complete_item(&self) {

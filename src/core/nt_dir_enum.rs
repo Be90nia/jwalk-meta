@@ -22,6 +22,8 @@ use winapi::um::winnt::{
 };
 
 /// NtQueryDirectoryFileEx 的 64KB I/O 缓冲区，减少系统调用次数。
+/// 本地磁盘 64KB 已足够（单次系统调用微秒级延迟）。
+/// SMB/网络路径可考虑更大值以减少网络往返，但需权衡 TLS 内存占用。
 const BUFFER_SIZE: usize = 64 * 1024;
 
 // 线程本地缓冲区，在 rayon worker 线程间复用 64KB 堆分配。
