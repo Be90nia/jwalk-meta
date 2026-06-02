@@ -33,8 +33,9 @@ impl<C: ClientState> StreamingContext<C> {
     }
 
     /// 调度一个子目录的读取任务到优先队列。
-    pub(crate) fn schedule(&self, weighted: Weighted<ReadDirSpec<C>>) {
-        self.run_context.schedule_read_dir_spec(weighted);
+    /// 返回 true 表示成功入队，false 表示队列已关闭（遍历已停止）。
+    pub(crate) fn schedule(&self, weighted: Weighted<ReadDirSpec<C>>) -> bool {
+        self.run_context.schedule_read_dir_spec(weighted)
     }
 }
 

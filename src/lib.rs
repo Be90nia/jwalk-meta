@@ -808,8 +808,9 @@ fn read_dir_windows<C: ClientState>(
         // 枚举完成后非流式部分使用完整 pipe_size 统一权重。
         let weight = parent_weight.saturating_add(streamed_count.get() + 1);
             *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
-            ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight));
-            streamed_count.set(streamed_count.get() + 1);
+            if ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight)) {
+                streamed_count.set(streamed_count.get() + 1);
+            }
         })
     } else {
         // ── 非流式路径 ──
