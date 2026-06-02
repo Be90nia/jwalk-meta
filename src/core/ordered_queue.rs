@@ -4,8 +4,12 @@ use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError};
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::*;
+
+/// Strict 模式等待队头元素的最大时长，超时后降级为弹出最高优先级元素。
+const STRICT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(crate) struct OrderedQueue<T>
 where
@@ -104,26 +108,14 @@ where
         self.stop.load(AtomicOrdering::Acquire)
     }
 
-    fn try_next_relaxed(&mut self) -> Result<Ordered<T>, TryRecvError> {
-        if self.is_stop() {
-            return Err(TryRecvError::Disconnected);
-        }
-
-        while let Ok(ordered_work) = self.receiver.try_recv() {
-            self.receive_buffer.push(ordered_work)
-        }
-
-        if let Some(ordered_work) = self.receive_buffer.pop() {
-            Ok(ordered_work)
-        } else if self.pending_count() == 0 {
-            Err(TryRecvError::Disconnected)
-        } else {
-            Err(TryRecvError::Empty)
+    /// 批量 drain channel 中所有就绪元素到 receive_buffer。
+    fn drain_channel(&mut self) {
+        while let Ok(ordered) = self.receiver.try_recv() {
+            self.receive_buffer.push(ordered);
         }
     }
 
-    fn try_next_strict(&mut self) -> Result<Ordered<T>, TryRecvError> {
-        let looking_for = &self.ordered_matcher.looking_for;
+    fn try_next_relaxed(&mut self) -> Result<Ordered<T>, TryRecvError> {
         let timeout = std::time::Duration::from_millis(1);
 
         loop {
@@ -131,6 +123,47 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
+            // 先非阻塞 drain 所有已就绪元素
+            self.drain_channel();
+
+            if let Some(ordered_work) = self.receive_buffer.pop() {
+                return Ok(ordered_work);
+            } else if self.pending_count() == 0 {
+                return Err(TryRecvError::Disconnected);
+            }
+
+            // buffer 为空且仍有 pending 项：短超时等待新元素
+            match self.receiver.recv_timeout(timeout) {
+                Ok(ordered) => {
+                    self.receive_buffer.push(ordered);
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    // Channel 断开，drain 残余
+                    self.drain_channel();
+                    if let Some(top) = self.receive_buffer.pop() {
+                        return Ok(top);
+                    }
+                    return Err(TryRecvError::Disconnected);
+                }
+            }
+        }
+    }
+
+    /// Strict 模式：优先等待队头（looking_for），超时后降级弹出最高优先级元素。
+    fn try_next_strict(&mut self) -> Result<Ordered<T>, TryRecvError> {
+        let deadline = Instant::now() + STRICT_WAIT_TIMEOUT;
+
+        loop {
+            if self.is_stop() {
+                return Err(TryRecvError::Disconnected);
+            }
+
+            // 非 blocking drain：避免 channel 中有数据但没被检测到
+            self.drain_channel();
+
+            // 检查 buffer 中是否有目标元素（每次循环重新获取 looking_for）
+            let looking_for = &self.ordered_matcher.looking_for;
             let top_ordered = self.receive_buffer.peek();
             if let Some(top_ordered) = top_ordered {
                 if top_ordered.index_path.eq(looking_for) {
@@ -142,22 +175,43 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            match self.receiver.recv_timeout(timeout) {
+            // 超时降级：如果等待太久，弹出 buffer 中最高优先级元素
+            if Instant::now() >= deadline {
+                if self.receive_buffer.peek().is_some() {
+                    let fallback = self.receive_buffer.pop().unwrap();
+                    self.ordered_matcher.advance_past(&fallback);
+                    return Ok(fallback);
+                }
+                // deadline 到期但 buffer 空 → 返回 Empty，让外层 yield 后重试
+                return Err(TryRecvError::Empty);
+            }
+
+            // 带超时的阻塞等待（remaining 最小 100μs，避免 0ms 忙等）
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_time = remaining.max(std::time::Duration::from_micros(100));
+            match self.receiver.recv_timeout(wait_time) {
                 Ok(ordered) => {
                     self.receive_buffer.push(ordered);
                 }
-                Err(err) => match err {
-                    crossbeam::channel::RecvTimeoutError::Timeout => continue,
-                    crossbeam::channel::RecvTimeoutError::Disconnected => {
-                        let top = self.receive_buffer.peek();
-                        if let Some(top_ordered) = top {
-                            if top_ordered.index_path.eq(looking_for) {
-                                break;
-                            }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    self.drain_channel();
+                    let looking_for = &self.ordered_matcher.looking_for;
+                    let top = self.receive_buffer.peek();
+                    if let Some(top_ordered) = top {
+                        if top_ordered.index_path.eq(looking_for) {
+                            break;
                         }
-                        return Err(TryRecvError::Disconnected);
                     }
-                },
+                    if self.receive_buffer.peek().is_some() {
+                        let fallback = self.receive_buffer.pop().unwrap();
+                        self.ordered_matcher.advance_past(&fallback);
+                        return Ok(fallback);
+                    }
+                    return Err(TryRecvError::Disconnected);
+                }
             }
         }
 

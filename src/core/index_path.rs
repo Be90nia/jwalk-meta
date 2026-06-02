@@ -1,5 +1,9 @@
 use std::cmp::Ordering;
 
+/// IndexPath 表示 DFS 遍历中的位置路径。
+///
+/// 每个元素是父目录中子目录的索引。
+/// Ord 实现使用反向比较（用于 BinaryHeap max-heap 语义）。
 #[derive(Clone, Debug)]
 pub struct IndexPath {
     pub indices: Vec<usize>,

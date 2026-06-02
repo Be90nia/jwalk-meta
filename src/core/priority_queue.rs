@@ -3,7 +3,6 @@
 use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError};
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::Duration;
 
 use super::*;
 
@@ -89,14 +88,14 @@ where
     }
 
     fn try_next(&mut self) -> Result<Weighted<T>, TryRecvError> {
-        let timeout = Duration::from_millis(1);
+        let timeout = std::time::Duration::from_millis(1);
 
         loop {
             if self.is_stop() {
                 return Err(TryRecvError::Disconnected);
             }
 
-            // Drain all available items into buffer
+            // 先非阻塞 drain 所有已就绪元素（避免每次都等 1ms）
             while let Ok(weighted) = self.receiver.try_recv() {
                 self.receive_buffer.push(weighted);
             }
@@ -107,7 +106,7 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            // Wait briefly for new items
+            // buffer 为空且仍有 pending 项：短超时等待新元素
             match self.receiver.recv_timeout(timeout) {
                 Ok(weighted) => {
                     self.receive_buffer.push(weighted);

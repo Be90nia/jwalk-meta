@@ -15,17 +15,18 @@
 
 ## 性能
 
-实测环境：Windows 11，SMB 网络共享 (`Z:\品质部测试`)
+实测环境：Windows 11，SMB 网络共享 (`Z:\测试`)
 
-| 指标 | 数值 |
-|------|------|
-| 总条目数 | 1,981,338 |
-| 目录数 | 412,935 |
-| 文件数 | 1,568,403 |
-| 总耗时 | 377 秒 |
-| 吞吐量 | 5,255 entries/s |
-| 首秒产出 | 15,007 entries |
-| 错误数 | 0 |
+
+| 指标     | 数值            |
+| -------- | --------------- |
+| 总条目数 | 1,981,338       |
+| 目录数   | 412,935         |
+| 文件数   | 1,568,403       |
+| 总耗时   | 377 秒          |
+| 吞吐量   | 5,255 entries/s |
+| 首秒产出 | 15,007 entries  |
+| 错误数   | 0               |
 
 对比优化前：同目录扫描首 265 秒仅有 271 条产出（卡在单个巨型目录的阻塞枚举上）。
 
@@ -88,14 +89,15 @@ for entry in WalkDir::new("foo")
 
 ### 核心组件
 
-| 组件 | 文件 | 职责 |
-|------|------|------|
-| `Weighted<T>` | `weighted.rs` | 带权重的调度单元，BinaryHeap max-heap |
-| `PriorityQueue` | `priority_queue.rs` | 线程安全的优先级队列 + channel |
-| `StreamingContext` | `read_dir_iter.rs` | 流式分发上下文，携带 parent_weight |
-| `ReadDirIter` | `read_dir_iter.rs` | 并行遍历迭代器，流式/常规双模式 |
-| `enumerate_dir_streaming` | `nt_dir_enum.rs` | NT Native API 流式枚举（Windows） |
-| `OrderedQueue` | `ordered_queue.rs` | 有序输出队列，Strict/Relaxed 排序 |
+
+| 组件                      | 文件                | 职责                                  |
+| ------------------------- | ------------------- | ------------------------------------- |
+| `Weighted<T>`             | `weighted.rs`       | 带权重的调度单元，BinaryHeap max-heap |
+| `PriorityQueue`           | `priority_queue.rs` | 线程安全的优先级队列 + channel        |
+| `StreamingContext`        | `read_dir_iter.rs`  | 流式分发上下文，携带 parent_weight    |
+| `ReadDirIter`             | `read_dir_iter.rs`  | 并行遍历迭代器，流式/常规双模式       |
+| `enumerate_dir_streaming` | `nt_dir_enum.rs`    | NT Native API 流式枚举（Windows）     |
+| `OrderedQueue`            | `ordered_queue.rs`  | 有序输出队列，Strict/Relaxed 排序     |
 
 ## 致谢
 

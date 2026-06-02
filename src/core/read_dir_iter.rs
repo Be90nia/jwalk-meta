@@ -73,10 +73,12 @@ impl<C: ClientState> ReadDirIter<C> {
             let (read_dir_spec_queue, read_dir_spec_iter) =
                 new_priority_queue(stop.clone());
 
-            // 根目录使用最大权重，确保最先被调度（优先淹没算法）
+            // 根目录使用高位权重，确保最先被调度（优先淹没算法）
+            // 使用 (usize::MAX >> 1) 避免 parent_weight + child_count 溢出
+            const ROOT_WEIGHT: usize = usize::MAX >> 1;
             for read_dir_spec in read_dir_specs.into_iter() {
                 read_dir_spec_queue
-                    .push(Weighted::new(read_dir_spec, IndexPath::new(vec![0]), usize::MAX))
+                    .push(Weighted::new(read_dir_spec, IndexPath::new(vec![0]), ROOT_WEIGHT))
                     .unwrap();
             }
 

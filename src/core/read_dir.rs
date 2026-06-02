@@ -41,7 +41,7 @@ impl<C: ClientState> ReadDir<C> {
     ) -> Vec<Weighted<ReadDirSpec<C>>> {
         let skip = self.streamed_child_count;
         let pipe_size = self.results_list.len(); // 水管大小 = 父目录总条目数
-        let weight = parent_weight + pipe_size;
+        let weight = parent_weight.saturating_add(pipe_size);
         let mut specs = Vec::new();
         for (i, spec) in self.read_children_specs().enumerate() {
             if i < skip {
