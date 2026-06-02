@@ -88,30 +88,16 @@ where
     }
 
     fn try_next(&mut self) -> Result<Weighted<T>, TryRecvError> {
+        let timeout = std::time::Duration::from_millis(1);
+
         loop {
             if self.is_stop() {
                 return Err(TryRecvError::Disconnected);
             }
 
-            // 1ms 超时 + 批量 drain：保留原始响应速度，
-            // drain 减少后续 recv 调用次数
-            match self.receiver.recv_timeout(std::time::Duration::from_millis(1)) {
-                Ok(weighted) => {
-                    self.receive_buffer.push(weighted);
-                    // 批量 drain channel 中所有已就绪的元素
-                    while let Ok(w) = self.receiver.try_recv() {
-                        self.receive_buffer.push(w);
-                    }
-                }
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                    // 超时：检查是否所有工作已完成
-                }
-                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
-                    // Channel 已断开，drain 残余元素
-                    while let Ok(w) = self.receiver.try_recv() {
-                        self.receive_buffer.push(w);
-                    }
-                }
+            // 先非阻塞 drain 所有已就绪元素（避免每次都等 1ms）
+            while let Ok(weighted) = self.receiver.try_recv() {
+                self.receive_buffer.push(weighted);
             }
 
             if let Some(weighted) = self.receive_buffer.pop() {
@@ -119,7 +105,17 @@ where
             } else if self.pending_count() == 0 {
                 return Err(TryRecvError::Disconnected);
             }
-            // buffer 为空但仍有 pending 项（被其他线程处理中），继续等待
+
+            // buffer 为空且仍有 pending 项：短超时等待新元素
+            match self.receiver.recv_timeout(timeout) {
+                Ok(weighted) => {
+                    self.receive_buffer.push(weighted);
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    return Err(TryRecvError::Disconnected);
+                }
+            }
         }
     }
 }
