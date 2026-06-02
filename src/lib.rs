@@ -630,8 +630,15 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                                 follow_link_ancestors: follow_link_ancestors.clone(),
                             };
 
-                            // 优先淹没算法：weight = parent_weight + 已发现子目录数（饱和加法防溢出）
-                            let weight = parent_weight.saturating_add(streamed_count.get() + 1);
+                        // 优先淹没算法：统一权重策略
+                        // 流式路径：weight = parent_weight + (streamed_count + 1)
+                        // 非流式路径(read_dir.rs)：weight = parent_weight + pipe_size
+                        //
+                        // 流式阶段 pipe_size 尚不可知（枚举未完成），
+                        // 使用 streamed_count+1 作为递增权重下界，
+                        // 确保先发现的子目录先被调度（BFS倾向）。
+                        // 枚举完成后非流式部分使用完整 pipe_size 统一权重。
+                        let weight = parent_weight.saturating_add(streamed_count.get() + 1);
                             *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
                             ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight));
                             streamed_count.set(streamed_count.get() + 1);

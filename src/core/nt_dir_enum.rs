@@ -90,10 +90,19 @@ struct NtDllFuncs {
 }
 
 /// 懒加载 ntdll 函数指针。失败时 panic（启动时一次性初始化）。
+///
+/// 设计决策：LoadLibraryW 增加了 ntdll.dll 的引用计数但未调用 FreeLibrary。
+/// 这是有意为之——ntdll.dll 是 Windows 进程级核心 DLL，永远不会被卸载，
+/// 函数指针需要在整个进程生命周期内保持有效。
 fn ntdll_funcs() -> &'static NtDllFuncs {
     use std::sync::OnceLock;
     static FUNCS: OnceLock<NtDllFuncs> = OnceLock::new();
     FUNCS.get_or_init(|| unsafe {
+        // SAFETY:
+        // 1. LoadLibraryW("ntdll.dll") 安全——ntdll.dll 是 Windows 系统核心 DLL，始终存在
+        // 2. GetProcAddress 获取的函数指针签名由上面的 type alias 保证与 NT API 文档一致
+        // 3. transmute 将 raw 指针转为类型化函数指针，类型由 NtQueryDirectoryFileExFn
+        //    和 RtlNtStatusToDosErrorFn 的签名定义保证正确
         let ntdll_name = to_wide_null("ntdll.dll\0");
         let module = LoadLibraryW(ntdll_name.as_ptr());
         if module.is_null() {
@@ -239,8 +248,11 @@ pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInf
 
         let mut offset: usize = 0;
         loop {
+            // SAFETY: offset 从 0 开始，每次递增 NextEntryOffset（对齐的 u32），
+            // 且 bytes_returned 保证 offset < bytes_returned <= buffer.len()
             let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
             // SAFETY: entry_ptr 指向 buffer 中有效的 FILE_ID_BOTH_DIR_INFO 数据。
+            // 结构体对齐由 NT API 保证（4 字节对齐）。
             let entry = unsafe { &*(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
 
             let name_len = entry.FileNameLength as usize;
@@ -252,6 +264,7 @@ pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInf
             let is_dot = name_chars == 1 && first_char == b'.' as u16;
             let is_dotdot = name_chars == 2
                 && first_char == b'.' as u16
+                // SAFETY: name_chars == 2 guarantees at least 2 u16 elements in FileName
                 && unsafe { *entry.FileName.as_ptr().add(1) } == b'.' as u16;
 
             if !is_dot && !is_dotdot {
@@ -359,6 +372,7 @@ pub fn enumerate_dir_streaming(
 
         let mut offset: usize = 0;
         loop {
+            // SAFETY: 同 enumerate_dir 中的 offset 边界保证
             let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
             // SAFETY: 同 enumerate_dir。
             let entry = unsafe { &*(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
@@ -371,6 +385,7 @@ pub fn enumerate_dir_streaming(
             let is_dot = name_chars == 1 && first_char == b'.' as u16;
             let is_dotdot = name_chars == 2
                 && first_char == b'.' as u16
+                // SAFETY: name_chars == 2 guarantees at least 2 u16 elements in FileName
                 && unsafe { *entry.FileName.as_ptr().add(1) } == b'.' as u16;
 
             if !is_dot && !is_dotdot {

@@ -10,20 +10,26 @@ pub struct IndexPath {
 }
 
 impl IndexPath {
+    /// Create a new IndexPath from a vector of indices.
     pub fn new(indices: Vec<usize>) -> IndexPath {
         IndexPath { indices }
     }
 
+    /// Return a new IndexPath with an additional index appended.
+    /// Does not modify self (immutable).
     pub fn adding(&self, index: usize) -> IndexPath {
         let mut indices = self.indices.clone();
         indices.push(index);
         IndexPath::new(indices)
     }
 
+    /// Append an index to this IndexPath in place (mutable).
     pub fn push(&mut self, index: usize) {
         self.indices.push(index);
     }
 
+    /// Increment the last index by 1. Used for DFS sibling traversal.
+    /// Panics in debug mode if indices is empty.
     pub fn increment_last(&mut self) {
         debug_assert!(!self.indices.is_empty(), "IndexPath::increment_last called on empty indices");
         if let Some(last) = self.indices.last_mut() {
@@ -31,10 +37,12 @@ impl IndexPath {
         }
     }
 
+    /// Remove and return the last index. Returns `None` if empty.
     pub fn pop(&mut self) -> Option<usize> {
         self.indices.pop()
     }
 
+    /// Returns `true` if this IndexPath has no indices (DFS traversal complete).
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }

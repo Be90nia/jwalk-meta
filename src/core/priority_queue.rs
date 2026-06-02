@@ -25,6 +25,10 @@ where
     pending_count: Arc<AtomicUsize>,
 }
 
+/// Bounded channel 容量：限制内存使用，同时提供足够缓冲避免频繁阻塞。
+/// 设为 1024，约等于 rayon 默认线程数 × 128，平衡吞吐与内存。
+const CHANNEL_CAPACITY: usize = 1024;
+
 pub(crate) fn new_priority_queue<T>(
     stop: Arc<AtomicBool>,
 ) -> (PriorityQueue<T>, PriorityQueueIter<T>)
@@ -32,7 +36,7 @@ where
     T: Send,
 {
     let pending_count = Arc::new(AtomicUsize::new(0));
-    let (sender, receiver) = channel::unbounded();
+    let (sender, receiver) = channel::bounded(CHANNEL_CAPACITY);
     (
         PriorityQueue {
             sender,
@@ -91,16 +95,19 @@ where
     }
 
     fn try_next(&mut self) -> Result<Weighted<T>, TryRecvError> {
-        let timeout = std::time::Duration::from_millis(1);
+        // 自适应退避：热路径短等待（10μs），逐步增长到 1ms
+        // 避免空闲时空转浪费 CPU，同时保持对新数据的快速响应
+        let mut spin_count: u32 = 0;
 
         loop {
             if self.is_stop() {
                 return Err(TryRecvError::Disconnected);
             }
 
-            // 先非阻塞 drain 所有已就绪元素（避免每次都等 1ms）
+            // 先非阻塞 drain 所有已就绪元素
             while let Ok(weighted) = self.receiver.try_recv() {
                 self.receive_buffer.push(weighted);
+                spin_count = 0; // 有数据时重置退避计数
             }
 
             if let Some(weighted) = self.receive_buffer.pop() {
@@ -109,7 +116,14 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            // buffer 为空且仍有 pending 项：短超时等待新元素
+            // 自适应等待：逐步增加超时，减少空转 CPU 浪费
+            let timeout = match spin_count {
+                0..=10 => std::time::Duration::from_micros(10),
+                11..=50 => std::time::Duration::from_micros(100),
+                _ => std::time::Duration::from_millis(1),
+            };
+            spin_count += 1;
+
             match self.receiver.recv_timeout(timeout) {
                 Ok(weighted) => {
                     self.receive_buffer.push(weighted);

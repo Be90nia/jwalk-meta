@@ -43,6 +43,9 @@ struct OrderedMatcher {
     child_count_stack: Vec<usize>,
 }
 
+/// Bounded channel 容量：限制内存使用，同时提供足够缓冲避免频繁阻塞。
+const CHANNEL_CAPACITY: usize = 1024;
+
 pub(crate) fn new_ordered_queue<T>(
     stop: Arc<AtomicBool>,
     ordering: Ordering,
@@ -51,7 +54,7 @@ where
     T: Send,
 {
     let pending_count = Arc::new(AtomicUsize::new(0));
-    let (sender, receiver) = channel::unbounded();
+    let (sender, receiver) = channel::bounded(CHANNEL_CAPACITY);
     (
         OrderedQueue {
             sender,
@@ -119,7 +122,8 @@ where
     }
 
     fn try_next_relaxed(&mut self) -> Result<Ordered<T>, TryRecvError> {
-        let timeout = std::time::Duration::from_millis(1);
+        // 自适应退避：热路径短等待（10μs），逐步增长到 1ms
+        let mut consecutive_waits: u32 = 0;
 
         loop {
             if self.is_stop() {
@@ -135,12 +139,22 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            // buffer 为空且仍有 pending 项：短超时等待新元素
+            // 自适应等待：连续等待次数越多，timeout 越长
+            let timeout = match consecutive_waits {
+                0..=10 => Duration::from_micros(10),
+                11..=50 => Duration::from_micros(100),
+                _ => Duration::from_millis(1),
+            };
+
             match self.receiver.recv_timeout(timeout) {
                 Ok(ordered) => {
                     self.receive_buffer.push(ordered);
+                    consecutive_waits = 0; // 有数据到达，重置退避
                 }
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    consecutive_waits += 1;
+                    continue;
+                }
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     // Channel 断开，drain 残余
                     self.drain_channel();

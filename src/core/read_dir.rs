@@ -30,8 +30,7 @@ impl<C: ClientState> ReadDir<C> {
         })
     }
 
-    /// 单遍遍历：同时收集 specs 和计算权重。
-    /// 已通过流式分发调度的子目录跳过（index >= streamed_child_count）。
+    /// 单遍遍历：直接生成 Weighted<ReadDirSpec>，跳过已流式调度的子目录。
     /// 优先淹没算法：weight = parent_weight + pipe_size（父目录总条目数），
     /// 权重继承确保大管道的分支也获得高优先级。
     pub fn weighted_children_specs(
@@ -40,18 +39,24 @@ impl<C: ClientState> ReadDir<C> {
         parent_weight: usize,
     ) -> Vec<Weighted<ReadDirSpec<C>>> {
         let skip = self.streamed_child_count;
-        let pipe_size = self.results_list.len(); // 水管大小 = 父目录总条目数
+        let pipe_size = self.results_list.len();
         let weight = parent_weight.saturating_add(pipe_size);
-        let mut specs = Vec::new();
-        for (i, spec) in self.read_children_specs().enumerate() {
+
+        // 单遍遍历：跳过已流式部分，直接构造 Weighted<ReadDirSpec>
+        // 避免先收集 (usize, ReadDirSpec) 中间 Vec 再 map 的双遍+双分配开销
+        let mut specs = Vec::with_capacity(pipe_size.saturating_sub(skip));
+        for (i, entry_result) in self.results_list.iter().enumerate() {
             if i < skip {
                 continue;
             }
-            specs.push((i, spec));
+            if let Some(spec) = entry_result
+                .as_ref()
+                .ok()
+                .and_then(|e| e.read_children_spec(self.read_dir_state.clone()))
+            {
+                specs.push(Weighted::new(spec, index_path.adding(i), weight));
+            }
         }
         specs
-            .into_iter()
-            .map(|(i, spec)| Weighted::new(spec, index_path.adding(i), weight))
-            .collect()
     }
 }
