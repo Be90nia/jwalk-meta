@@ -1,5 +1,6 @@
 use super::*;
 use crate::Result;
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 /// Client's read dir function.
 ///
@@ -110,6 +111,9 @@ impl<C: ClientState> ReadDirIter<C> {
                 );
             });
             if startup_rx.map_or(false, |(rx, duration)| rx.recv_timeout(duration).is_err()) {
+                // busy timeout 触发：通知已 spawn 的线程停止，
+                // 避免孤立线程继续遍历整个目录树
+                stop.store(true, AtomicOrdering::Release);
                 return None;
             }
             Some((
@@ -192,21 +196,34 @@ fn multi_threaded_walk_dir<C: ClientState>(
     let regular_count = weighted_children_specs.as_ref().map_or(0, Vec::len);
     let child_count = streamed_count + regular_count;
 
+    // 发送结果到 OrderedQueue
     let ordered_read_dir_result = Ordered::new(
         read_dir_result,
-        index_path,
+        index_path.clone(),
         child_count,
     );
 
     let send_ok = run_context.send_read_dir_result(ordered_read_dir_result);
 
     if send_ok {
+        // 仅在结果成功入队时调度子目录
         if let Some(weighted_children_specs) = weighted_children_specs {
             for each in weighted_children_specs {
-                let _ = run_context.schedule_read_dir_spec(each);
+                // 调度失败说明 channel 已关闭（用户 drop 了迭代器），
+                // 立即停止调度剩余子目录
+                if !run_context.schedule_read_dir_spec(each) {
+                    break;
+                }
             }
         }
     }
 
-    run_context.complete_item();
+    // send_ok=false 时 result 未入队，只需递减 spec_queue 的 count
+    // send_ok=true 时 result 已入队，两个 queue 的 count 都需要递减
+    if send_ok {
+        run_context.complete_item();
+    } else {
+        // 结果未入队，但 spec 已消耗：仅递减 spec_queue 的 pending count
+        run_context.read_dir_spec_queue.complete_item();
+    }
 }

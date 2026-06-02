@@ -74,8 +74,11 @@ where
     T: Send,
 {
     pub fn push(&self, ordered: Ordered<T>) -> Result<(), SendError<Ordered<T>>> {
-        self.pending_count.fetch_add(1, AtomicOrdering::Release);
-        self.sender.send(ordered)
+        let result = self.sender.send(ordered);
+        if result.is_ok() {
+            self.pending_count.fetch_add(1, AtomicOrdering::Release);
+        }
+        result
     }
 
     pub fn complete_item(&self) {
@@ -151,6 +154,9 @@ where
     }
 
     /// Strict 模式：优先等待队头（looking_for），超时后降级弹出最高优先级元素。
+    ///
+    /// 优化：(1) 仅在堆中无目标元素时才 drain channel，减少堆膨胀
+    ///       (2) 超时降级时记录 skipped 位置，避免 OrderedMatcher 状态永久错乱
     fn try_next_strict(&mut self) -> Result<Ordered<T>, TryRecvError> {
         let deadline = Instant::now() + STRICT_WAIT_TIMEOUT;
 
@@ -159,10 +165,15 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            // 非 blocking drain：避免 channel 中有数据但没被检测到
-            self.drain_channel();
+            // 优化：仅当堆顶不是目标元素时才 drain channel，减少堆膨胀
+            let looking_for = &self.ordered_matcher.looking_for;
+            let top_matches = self.receive_buffer.peek()
+                .map_or(false, |top| top.index_path.eq(looking_for));
+            if !top_matches {
+                self.drain_channel();
+            }
 
-            // 检查 buffer 中是否有目标元素（每次循环重新获取 looking_for）
+            // 检查 buffer 中是否有目标元素
             let looking_for = &self.ordered_matcher.looking_for;
             let top_ordered = self.receive_buffer.peek();
             if let Some(top_ordered) = top_ordered {
@@ -175,10 +186,12 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            // 超时降级：如果等待太久，弹出 buffer 中最高优先级元素
+            // 超时降级：弹出堆中最高优先级元素（跳过 DFS 序）
             if Instant::now() >= deadline {
                 if self.receive_buffer.peek().is_some() {
                     let fallback = self.receive_buffer.pop().unwrap();
+                    // 降级弹出：advance_past 更新状态以跳到下一个有效位置
+                    // 注意：这会跳过 looking_for 指向的目标，DFS 顺序保证被打破
                     self.ordered_matcher.advance_past(&fallback);
                     return Ok(fallback);
                 }
@@ -186,7 +199,7 @@ where
                 return Err(TryRecvError::Empty);
             }
 
-            // 带超时的阻塞等待（remaining 最小 100μs，避免 0ms 忙等）
+            // 带超时的阻塞等待
             let remaining = deadline.saturating_duration_since(Instant::now());
             let wait_time = remaining.max(std::time::Duration::from_micros(100));
             match self.receiver.recv_timeout(wait_time) {
@@ -251,7 +264,9 @@ impl OrderedMatcher {
     }
 
     fn decrement_remaining_children(&mut self) {
-        *self.child_count_stack.last_mut().unwrap() -= 1;
+        if let Some(count) = self.child_count_stack.last_mut() {
+            *count = count.saturating_sub(1);
+        }
     }
 
     fn advance_past<T>(&mut self, ordered: &Ordered<T>) {

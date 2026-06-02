@@ -500,14 +500,18 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
 
                     // Windows FILETIME epoch (1601-01-01) to UNIX epoch offset in 100ns ticks
                     const EPOCH_DIFFERENCE_100NS: i64 = 116_444_736_000_000_000;
+                    /// 100-ns ticks per second (FILETIME precision)
+                    const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
+                    /// Nanoseconds per 100-ns tick
+                    const NS_PER_HUNDRED_NS: i64 = 100;
 
                     /// 将 Windows FILETIME (100-ns ticks since 1601) 转为 SystemTime
                     fn filetime_to_systemtime(ft: i64) -> Option<std::time::SystemTime> {
                         if ft == 0 { return None; }
                         let duration_100ns = ft.saturating_sub(EPOCH_DIFFERENCE_100NS);
                         if duration_100ns < 0 { return None; }
-                        let secs = (duration_100ns / 10_000_000) as u64;
-                        let nanos = ((duration_100ns % 10_000_000) * 100) as u32;
+                        let secs = (duration_100ns / HUNDRED_NS_PER_SEC) as u64;
+                        let nanos = ((duration_100ns % HUNDRED_NS_PER_SEC) * NS_PER_HUNDRED_NS) as u32;
                         Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
                     }
 
@@ -819,7 +823,14 @@ impl Parallelism {
                     thread_pool = thread_pool.num_threads(*num_threads);
                 }
                 if let Ok(thread_pool) = thread_pool.build() {
-                    thread_pool.spawn(op);
+                    // ThreadPool::drop 会阻塞 join 所有工作线程，
+                    // 如果在 spawn() 方法内 drop 则丧失流式输出能力。
+                    // 方案：在独立线程中持有 pool，让工作异步执行。
+                    let _ = std::thread::spawn(move || {
+                        thread_pool.spawn(op);
+                        // ThreadPool 在此 drop，等待所有工作完成
+                        // 但不影响主线程的流式消费
+                    });
                 } else {
                     rayon::spawn(op);
                 }

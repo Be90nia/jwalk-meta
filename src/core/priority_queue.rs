@@ -53,8 +53,11 @@ where
     T: Send,
 {
     pub fn push(&self, weighted: Weighted<T>) -> Result<(), SendError<Weighted<T>>> {
-        self.pending_count.fetch_add(1, AtomicOrdering::Release);
-        self.sender.send(weighted)
+        let result = self.sender.send(weighted);
+        if result.is_ok() {
+            self.pending_count.fetch_add(1, AtomicOrdering::Release);
+        }
+        result
     }
 
     pub fn complete_item(&self) {

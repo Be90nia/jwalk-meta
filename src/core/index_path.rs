@@ -25,7 +25,10 @@ impl IndexPath {
     }
 
     pub fn increment_last(&mut self) {
-        *self.indices.last_mut().unwrap() += 1;
+        debug_assert!(!self.indices.is_empty(), "IndexPath::increment_last called on empty indices");
+        if let Some(last) = self.indices.last_mut() {
+            *last += 1;
+        }
     }
 
     pub fn pop(&mut self) -> Option<usize> {
