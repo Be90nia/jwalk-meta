@@ -305,31 +305,58 @@ impl<C: ClientState> DirEntry<C> {
 
         if dir_entry.file_type.is_dir() {
             let target = fs::read_link(path).map_err(|err| Error::from_io(self.depth, err))?;
-            // 解析符号链接目标为绝对路径，防止相对路径绕过循环检测
+            // 解析符号链接目标为绝对路径
             let resolved_target = if target.is_absolute() {
                 target
             } else {
-                // 相对符号链接：基于链接所在目录解析
                 self.parent_path.join(&target)
             };
             let canonical_target = resolved_target.canonicalize().ok().unwrap_or(resolved_target);
 
-            if let Some(ancestors) = &self.follow_link_ancestors {
-                for ancestor in ancestors.iter().rev() {
-                    // 对祖先也做 canonicalize 以确保路径比较准确
-                    let canonical_ancestor = ancestor.canonicalize().ok().unwrap_or_else(|| ancestor.as_ref().to_path_buf());
-                    if canonical_target == canonical_ancestor {
-                        return Err(Error::from_loop(
-                            self.depth,
-                            ancestor.as_ref(),
-                            path,
-                        ));
+            // 使用 metadata identity 进行循环检测（比 canonicalize 路径比较更可靠高效）
+            // Unix: (dev, ino) 对标识唯一文件系统对象
+            // Windows: (volume_serial_number, file_index) 对标识唯一文件系统对象
+            if let Ok(target_meta) = fs::metadata(&canonical_target) {
+                let target_ext = get_metadata_ext(&target_meta);
+
+                if let Some(ancestors) = &self.follow_link_ancestors {
+                    for ancestor in ancestors.iter().rev() {
+                        if let Ok(ancestor_meta) = fs::metadata(ancestor.as_ref()) {
+                            let ancestor_ext = get_metadata_ext(&ancestor_meta);
+                            if Self::metadata_identity_eq(&target_ext, &ancestor_ext) {
+                                return Err(Error::from_loop(
+                                    self.depth,
+                                    ancestor.as_ref(),
+                                    path,
+                                ));
+                            }
+                        }
                     }
                 }
             }
         }
 
         Ok(dir_entry)
+    }
+
+    /// 比较 metadata identity 判断是否为同一文件系统对象。
+    ///
+    /// Unix 使用 (dev, ino)，Windows 使用 (volume_serial_number, file_index)。
+    /// 如果任一字段不可用则返回 false（保守策略：宁可漏检也不误报）。
+    fn metadata_identity_eq(a: &MetaDataExt, b: &MetaDataExt) -> bool {
+        #[cfg(unix)]
+        {
+            a.st_dev == b.st_dev && a.st_ino == b.st_ino
+        }
+        #[cfg(windows)]
+        {
+            match (a.volume_serial_number, a.file_index, b.volume_serial_number, b.file_index) {
+                (Some(vol_a), Some(idx_a), Some(vol_b), Some(idx_b)) => {
+                    vol_a == vol_b && idx_a == idx_b
+                }
+                _ => false,
+            }
+        }
     }
 }
 
