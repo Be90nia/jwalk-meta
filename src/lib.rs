@@ -693,12 +693,32 @@ mod read_dir_windows_helpers {
         }
     }
 
-    /// 从 DirEntryInfo 构造 MetaDataExt
-    pub(super) fn make_metadata_ext(info: &DirEntryInfo) -> MetaDataExt {
+    /// 从 DirEntryInfo 构造 MetaDataExt。
+    ///
+    /// NT API 路径下 `number_of_links` 和 `volume_serial_number` 不可用，
+    /// 需要额外调用 Win32 API (`GetFileInformationByHandle`) 获取。
+    /// 当 `win32_fallback_path` 为 `Some` 时，使用 Win32 元数据填充这些字段。
+    pub(super) fn make_metadata_ext(
+        info: &DirEntryInfo,
+        win32_fallback_path: Option<&Path>,
+    ) -> MetaDataExt {
+        let (volume_serial_number, number_of_links) = if let Some(path) = win32_fallback_path {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    use crate::core::get_metadata_ext;
+                    let ext = get_metadata_ext(&metadata);
+                    (ext.volume_serial_number, ext.number_of_links)
+                }
+                Err(_) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
         MetaDataExt {
             file_attributes: info.file_attributes,
-            volume_serial_number: None,
-            number_of_links: None,
+            volume_serial_number,
+            number_of_links,
             file_index: Some(info.file_id),
         }
     }
@@ -717,8 +737,15 @@ mod read_dir_windows_helpers {
         } else {
             None
         };
+        // 当 read_metadata_ext 为 true 时，构建完整路径用于 Win32 fallback，
+        // 以获取 NT API 无法提供的 number_of_links 和 volume_serial_number。
+        let win32_fallback_path = if read_metadata_ext {
+            Some(parent_path.join(&info.file_name))
+        } else {
+            None
+        };
         let entry_metadata_ext = if read_metadata_ext {
-            Some(make_metadata_ext(info))
+            Some(make_metadata_ext(info, win32_fallback_path.as_deref()))
         } else {
             None
         };
