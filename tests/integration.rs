@@ -1636,3 +1636,192 @@ fn permission_denied_graceful() {
         "expected 1 error for nonexistent path"
     );
 }
+
+#[test]
+fn permission_denied_mixed_scenario() {
+    let dir = Dir::tmp();
+    dir.mkdirp("readable_a");
+    dir.mkdirp("readable_a/sub");
+    dir.touch("readable_a/file.txt");
+    dir.touch("readable_a/sub/nested.txt");
+    dir.mkdirp("readable_b");
+    dir.touch("readable_b/other.txt");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let restricted = dir.join("restricted");
+        std::fs::create_dir_all(&restricted).unwrap();
+        std::fs::File::create(restricted.join("secret.txt")).unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let wd = WalkDir::new(dir.path()).sort(true);
+        let r = dir.run_recursive(wd);
+
+        let readable_paths: Vec<_> = r
+            .ents()
+            .iter()
+            .filter(|e| {
+                let p = e.path().to_string_lossy();
+                p.contains("readable_a") || p.contains("readable_b")
+            })
+            .collect();
+        assert!(
+            readable_paths.len() >= 6,
+            "readable dirs should have full content, got {} readable entries",
+            readable_paths.len()
+        );
+
+        let has_restricted_error = r
+            .errs()
+            .iter()
+            .any(|e| format!("{:?}", e).contains("restricted"));
+        assert!(
+            has_restricted_error,
+            "expected error for restricted directory"
+        );
+
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    {
+        let wd = WalkDir::new(dir.path()).sort(true);
+        let r = dir.run_recursive(wd);
+        r.assert_no_errors();
+        assert!(
+            r.ents().len() >= 7,
+            "expected >= 7 entries on Windows, got {}",
+            r.ents().len()
+        );
+    }
+}
+
+#[test]
+fn symlink_file_and_cycle_detection() {
+    let dir = Dir::tmp();
+    dir.touch("real.txt");
+    dir.mkdirp("subdir");
+    dir.touch("subdir/nested.txt");
+    dir.mkdirp("link_container");
+
+    let make_file_symlink = |src: PathBuf, link: PathBuf| -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(&src, &link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, &link)
+        }
+    };
+
+    if make_file_symlink(dir.join("real.txt"), dir.join("link_container/link.txt")).is_err() {
+        eprintln!("skipping symlink_file_and_cycle_detection: symlink creation failed");
+        return;
+    }
+
+    let make_dir_symlink = |src: PathBuf, link: PathBuf| -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(&src, &link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, &link)
+        }
+    };
+
+    if make_dir_symlink(dir.join("subdir"), dir.join("link_container/link_dir")).is_err() {
+        eprintln!("skipping dir symlink creation: failed");
+        return;
+    }
+
+    // Test without follow_links
+    let wd = WalkDir::new(dir.path()).sort(true);
+    let r = dir.run_recursive(wd);
+    r.assert_no_errors();
+
+    let file_link = r.ents().iter().find(|e| e.file_name() == "link.txt");
+    assert!(file_link.is_some(), "file symlink not found");
+    assert!(file_link.unwrap().path_is_symlink(), "link.txt should be a symlink");
+
+    let dir_link = r.ents().iter().find(|e| e.file_name() == "link_dir");
+    assert!(dir_link.is_some(), "dir symlink not found");
+    assert!(dir_link.unwrap().path_is_symlink(), "link_dir should be a symlink");
+
+    // Test with follow_links
+    let wd_follow = WalkDir::new(dir.path()).follow_links(true).sort(true);
+    let r_follow = dir.run_recursive(wd_follow);
+    r_follow.assert_no_errors();
+
+    let follow_count = r_follow.ents().len();
+    let nofollow_count = r.ents().len();
+    assert!(
+        follow_count >= nofollow_count,
+        "follow_links should find at least as many entries: {} < {}",
+        follow_count, nofollow_count
+    );
+}
+
+#[test]
+fn symlink_cycle_detection_with_follow() {
+    let dir = Dir::tmp();
+    dir.mkdirp("a/b");
+
+    let make_dir_symlink = |src: PathBuf, link: PathBuf| -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(&src, &link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, &link)
+        }
+    };
+
+    if make_dir_symlink(dir.join("a"), dir.join("a/b/cycle")).is_err() {
+        eprintln!("skipping symlink_cycle_detection: symlink creation failed");
+        return;
+    }
+
+    let wd = WalkDir::new(dir.path()).follow_links(true).sort(true);
+    let r = dir.run_recursive(wd);
+    r.assert_no_errors();
+
+    assert!(
+        r.ents().len() < 20,
+        "cycle should be detected, got {} entries (possible infinite loop)",
+        r.ents().len()
+    );
+}
+
+#[test]
+fn broken_symlink_handling() {
+    let dir = Dir::tmp();
+    dir.mkdirp("links");
+
+    let make_symlink = |src: PathBuf, link: PathBuf| -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(&src, &link)
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, &link)
+        }
+    };
+
+    if make_symlink(dir.join("nonexistent_target"), dir.join("links/broken")).is_err() {
+        eprintln!("skipping broken_symlink_handling: symlink creation failed");
+        return;
+    }
+
+    let wd = WalkDir::new(dir.path()).sort(true);
+    let r = dir.run_recursive(wd);
+    r.assert_no_errors();
+
+    let broken = r.ents().iter().find(|e| e.file_name() == "broken");
+    assert!(broken.is_some(), "broken symlink should appear as entry");
+    assert!(broken.unwrap().path_is_symlink(), "broken should be a symlink");
+}
