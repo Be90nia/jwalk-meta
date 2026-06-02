@@ -790,7 +790,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
 impl<C: ClientState> Clone for WalkDirOptions<C> {
     fn clone(&self) -> WalkDirOptions<C> {
         WalkDirOptions {
-            sort: false,
+            sort: self.sort,
             min_depth: self.min_depth,
             max_depth: self.max_depth,
             skip_hidden: self.skip_hidden,
