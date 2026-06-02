@@ -24,6 +24,11 @@ use winapi::um::winnt::{
 /// NtQueryDirectoryFileEx 的 64KB I/O 缓冲区，减少系统调用次数。
 const BUFFER_SIZE: usize = 64 * 1024;
 
+// 线程本地缓冲区，在 rayon worker 线程间复用 64KB 堆分配。
+thread_local! {
+    static TLS_BUFFER: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+}
+
 /// FILE_ID_BOTH_DIR_INFO 的文件信息类编号。
 const FILE_ID_BOTH_DIR_INFO_CLASS: u32 = 37;
 
@@ -261,11 +266,27 @@ fn parse_buffer_entries(
 fn enumerate_dir_core(
     guard: &HandleGuard,
     funcs: &NtDllFuncs,
+    on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, OsString),
+) -> io::Result<()> {
+    let mut buffer = TLS_BUFFER.with(|b| {
+        b.borrow_mut().take().unwrap_or_else(|| vec![0u8; BUFFER_SIZE])
+    });
+
+    let result = enumerate_dir_core_inner(guard, funcs, &mut buffer, on_entry);
+
+    let _ = TLS_BUFFER.try_with(|b| {
+        *b.borrow_mut() = Some(buffer);
+    });
+
+    result
+}
+
+fn enumerate_dir_core_inner(
+    guard: &HandleGuard,
+    funcs: &NtDllFuncs,
+    buffer: &mut [u8],
     mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, OsString),
 ) -> io::Result<()> {
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-
-    // 首次调用时 RestartScan = 1（重新开始扫描）
     let mut restart_scan: i32 = 1;
 
     loop {
@@ -307,7 +328,7 @@ fn enumerate_dir_core(
             break;
         }
 
-        parse_buffer_entries(&buffer, &mut on_entry);
+        parse_buffer_entries(buffer, &mut on_entry);
     }
 
     Ok(())

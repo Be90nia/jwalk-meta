@@ -115,7 +115,7 @@
 
 mod core;
 
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::ThreadPool;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -562,22 +562,24 @@ impl Parallelism {
             Parallelism::Serial => op(),
             Parallelism::RayonDefaultPool { .. } => rayon::spawn(op),
             Parallelism::RayonNewPool(num_threads) => {
-                let mut thread_pool = ThreadPoolBuilder::new();
-                if *num_threads > 0 {
-                    thread_pool = thread_pool.num_threads(*num_threads);
+                thread_local! {
+                    static TLS_POOL: std::cell::RefCell<Option<rayon::ThreadPool>> = std::cell::RefCell::new(None);
                 }
-                if let Ok(thread_pool) = thread_pool.build() {
-                    // ThreadPool::drop 会阻塞 join 所有工作线程，
-                    // 如果在 spawn() 方法内 drop 则丧失流式输出能力。
-                    // 方案：在独立线程中持有 pool，让工作异步执行。
-                    let _ = std::thread::spawn(move || {
-                        thread_pool.spawn(op);
-                        // ThreadPool 在此 drop，等待所有工作完成
-                        // 但不影响主线程的流式消费
-                    });
-                } else {
-                    rayon::spawn(op);
-                }
+                TLS_POOL.with(|cell| {
+                    let mut pool_opt = cell.borrow_mut();
+                    if pool_opt.is_none() {
+                        let mut builder = rayon::ThreadPoolBuilder::new();
+                        if *num_threads > 0 {
+                            builder = builder.num_threads(*num_threads);
+                        }
+                        *pool_opt = builder.build().ok();
+                    }
+                    if let Some(pool) = pool_opt.as_ref() {
+                        pool.spawn(op);
+                    } else {
+                        rayon::spawn(op);
+                    }
+                })
             }
             Parallelism::RayonExistingPool { pool, .. } => pool.spawn(op),
         }
@@ -836,7 +838,7 @@ fn read_dir_windows<C: ClientState>(
             // 否则 OrderedQueue 的 pending_count 会不匹配，导致消费者永远挂起。
             // 返回包含错误 DirEntry 的 ReadDir，携带正确的 streamed_child_count。
             if streamed_child_count > 0 {
-                let mut read_dir = ReadDir::new(client_read_state, vec![Some(Err(Error::from_path(0, path.to_path_buf(), err)))]);
+                let mut read_dir = ReadDir::new(client_read_state, vec![Err(Error::from_path(0, path.to_path_buf(), err))]);
                 read_dir.streamed_child_count = streamed_child_count;
                 return Ok(read_dir);
             }
