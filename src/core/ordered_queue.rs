@@ -89,11 +89,6 @@ where
         result
     }
 
-    pub fn complete_item(&self) {
-        // AcqRel: Acquire 确保看到之前所有 push 的数据；
-        // Release 确保消费者 is_empty() load(Acquire) 能看到递减后的值。
-        self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
-    }
 }
 
 impl<T> Clone for OrderedQueue<T>
@@ -209,16 +204,10 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            // 超时降级：弹出堆中最高优先级元素（跳过 DFS 序）
             if Instant::now() >= deadline {
-                if self.receive_buffer.peek().is_some() {
-                    let fallback = self.receive_buffer.pop().unwrap();
-                    // 降级弹出：advance_past 更新状态以跳到下一个有效位置
-                    // 注意：这会跳过 looking_for 指向的目标，DFS 顺序保证被打破
-                    self.ordered_matcher.advance_past(&fallback);
-                    return Ok(fallback);
-                }
-                // deadline 到期但 buffer 空 → 返回 Empty，让外层 yield 后重试
+                // Timeout: don't corrupt matcher with wrong advance_past.
+                // Return Empty to yield thread and retry — producer will eventually
+                // send the looking_for item or complete.
                 return Err(TryRecvError::Empty);
             }
 
@@ -234,16 +223,16 @@ where
                 }
                 Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                     self.drain_channel();
-                    let looking_for = &self.ordered_matcher.looking_for;
-                    let top = self.receive_buffer.peek();
-                    if let Some(top_ordered) = top {
-                        if top_ordered.index_path.eq(looking_for) {
-                            break;
+                    // Try looking_for first for correctness
+                    if let Some(top) = self.receive_buffer.peek() {
+                        if top.index_path.eq(&self.ordered_matcher.looking_for) {
+                            let ordered = self.receive_buffer.pop().unwrap();
+                            self.ordered_matcher.advance_past(&ordered);
+                            return Ok(ordered);
                         }
                     }
-                    if self.receive_buffer.peek().is_some() {
-                        let fallback = self.receive_buffer.pop().unwrap();
-                        self.ordered_matcher.advance_past(&fallback);
+                    // Drain remaining in heap order (natural DFS order via BinaryHeap)
+                    if let Some(fallback) = self.receive_buffer.pop() {
                         return Ok(fallback);
                     }
                     return Err(TryRecvError::Disconnected);
@@ -270,6 +259,7 @@ where
             };
             match try_next {
                 Ok(next) => {
+                    self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
                     return Some(next);
                 }
                 Err(err) => match err {
