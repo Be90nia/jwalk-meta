@@ -592,11 +592,14 @@ impl Parallelism {
     }
 }
 
+#[cfg(not(windows))]
 fn is_hidden(file_name: &OsStr) -> bool {
-    file_name
-        .to_str()
-        .map(|s| s.starts_with('.'))
-        .unwrap_or(false)
+    file_name.as_bytes().first() == Some(b'.')
+}
+
+#[cfg(windows)]
+fn is_hidden(file_name: &OsStr) -> bool {
+    file_name.as_encoded_bytes().first() == Some(&b'.')
 }
 
 /// Windows 文件属性常量
@@ -807,7 +810,9 @@ fn read_dir_windows<C: ClientState>(
         // 确保先发现的子目录先被调度（BFS倾向）。
         // 枚举完成后非流式部分使用完整 pipe_size 统一权重。
         let weight = parent_weight.saturating_add(streamed_count.get() + 1);
-            *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
+            if let Some(last) = child_index_path.indices.last_mut() {
+                *last = streamed_count.get();
+            }
             if ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight)) {
                 streamed_count.set(streamed_count.get() + 1);
             }
@@ -902,6 +907,9 @@ fn read_dir_unix<C: ClientState>(
             let mut entry_metadata_ext = None;
             if read_metadata {
                 if let Ok(metadata) = fs_dir_entry.metadata() {
+                    if read_metadata_ext {
+                        entry_metadata_ext = Some(get_metadata_ext(&metadata));
+                    }
                     entry_metadata = Some(MetaData {
                         is_dir: metadata.is_dir(),
                         is_file: metadata.is_file(),
@@ -924,10 +932,9 @@ fn read_dir_unix<C: ClientState>(
                         permissions: None,
                     });
                 }
-                if read_metadata_ext {
-                    if let Ok(metadata) = fs::metadata(fs_dir_entry.path()) {
-                        entry_metadata_ext = Some(get_metadata_ext(&metadata));
-                    }
+            } else if read_metadata_ext {
+                if let Ok(metadata) = fs::metadata(fs_dir_entry.path()) {
+                    entry_metadata_ext = Some(get_metadata_ext(&metadata));
                 }
             }
 

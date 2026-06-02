@@ -30,6 +30,9 @@ const FILE_ID_BOTH_DIR_INFO_CLASS: u32 = 37;
 /// NtQueryDirectoryFileEx 返回 "没有更多文件" 的状态码。
 const STATUS_NO_MORE_FILES: i32 = -2147483642; // 0x80000006
 
+/// FILE_ATTRIBUTE_DIRECTORY flag value.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
 // ── FFI 结构体 ──────────────────────────────────────────────────────────
 
 /// NtQueryDirectoryFileEx 返回的目录条目信息结构。
@@ -206,17 +209,17 @@ fn open_dir_handle(path: &Path) -> io::Result<HandleGuard> {
 /// SAFETY: 调用者必须保证 buffer 包含有效的 NT API 返回数据。
 fn parse_buffer_entries(
     buffer: &[u8],
-    mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, &OsString),
+    mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, OsString),
 ) {
     let mut offset: usize = 0;
     loop {
-        // SAFETY: offset 从 0 开始，每次递增 NextEntryOffset（对齐的 u32），
-        // 且 bytes_returned 保证 offset < bytes_returned <= buffer.len()
+        // SAFETY: offset starts at 0 and advances by NextEntryOffset each iteration.
+        // The caller guarantees bytes_returned ensures offset < bytes_returned <= buffer.len().
         let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
-        // SAFETY: entry_ptr 指向 buffer 中有效的 FILE_ID_BOTH_DIR_INFO 数据。
-        // NT API 返回的 FILE_ID_BOTH_DIR_INFO 可能未对齐到结构体的自然对齐要求
-        // （只保证 4 字节对齐，但结构体含 u64 字段需要 8 字节对齐）。
-        // 使用 read_unaligned 避免未定义行为。
+        // SAFETY: FILE_ID_BOTH_DIR_INFO fields are packed and the struct may appear at
+        // unaligned offsets within the buffer (NT only guarantees 4-byte alignment, but
+        // the struct contains u64 fields requiring 8-byte alignment). read_unaligned is
+        // required precisely because the data is NOT guaranteed to be naturally aligned.
         let entry = unsafe { std::ptr::read_unaligned(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
 
         let name_len = entry.FileNameLength as usize;
@@ -240,7 +243,7 @@ fn parse_buffer_entries(
             };
             let file_name = OsString::from_wide(name_slice);
 
-            on_entry(&entry, &file_name);
+            on_entry(&entry, file_name);
         }
 
         let next_offset = entry.NextEntryOffset;
@@ -258,7 +261,7 @@ fn parse_buffer_entries(
 fn enumerate_dir_core(
     guard: &HandleGuard,
     funcs: &NtDllFuncs,
-    mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, &OsString),
+    mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, OsString),
 ) -> io::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
 
@@ -321,7 +324,7 @@ pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInf
 
     enumerate_dir_core(&guard, funcs, |entry, file_name| {
         result.push(DirEntryInfo {
-            file_name: file_name.clone(),
+            file_name,
             file_attributes: entry.FileAttributes,
             file_size: entry.EndOfFile as u64,
             creation_time: entry.CreationTime,
@@ -349,7 +352,7 @@ pub fn enumerate_dir_streaming(
 
     enumerate_dir_core(&guard, funcs, |entry, file_name| {
         let info = DirEntryInfo {
-            file_name: file_name.clone(),
+            file_name,
             file_attributes: entry.FileAttributes,
             file_size: entry.EndOfFile as u64,
             creation_time: entry.CreationTime,
@@ -359,7 +362,7 @@ pub fn enumerate_dir_streaming(
         };
 
         // FILE_ATTRIBUTE_DIRECTORY = 0x10
-        if info.file_attributes & 0x10 != 0 {
+        if info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
             on_subdir(&info);
         }
 

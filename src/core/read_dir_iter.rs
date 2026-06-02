@@ -1,3 +1,5 @@
+use smallvec::smallvec;
+
 use super::*;
 use crate::Result;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -81,7 +83,7 @@ impl<C: ClientState> ReadDirIter<C> {
             for read_dir_spec in read_dir_specs.into_iter() {
                 // 初始化阶段 channel 不可能满（刚创建），但用 expect 明确语义
                 read_dir_spec_queue
-                    .push(Weighted::new(read_dir_spec, IndexPath::new(vec![0]), ROOT_WEIGHT))
+                    .push(Weighted::new(read_dir_spec, IndexPath::new(smallvec![0]), ROOT_WEIGHT))
                     .expect("init: priority queue push should not fail");
             }
 
@@ -141,12 +143,9 @@ impl<C: ClientState> Iterator for ReadDirIter<C> {
                 let read_dir_result = core_read_dir_callback(read_dir_spec, None);
 
                 if let Ok(read_dir) = read_dir_result.as_ref() {
-                    for each_spec in read_dir
-                        .read_children_specs()
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                    {
+                    let mut specs = read_dir.read_children_specs().collect::<Vec<_>>();
+                    specs.reverse();
+                    for each_spec in specs {
                         read_dir_spec_stack.push(each_spec);
                     }
                 }
