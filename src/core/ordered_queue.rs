@@ -4,8 +4,12 @@ use crossbeam::channel::{self, Receiver, SendError, Sender, TryRecvError};
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use super::*;
+
+/// Strict 模式等待队头元素的最大时长，超时后降级为弹出最高优先级元素。
+const STRICT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(crate) struct OrderedQueue<T>
 where
@@ -104,33 +108,63 @@ where
         self.stop.load(AtomicOrdering::Acquire)
     }
 
+    /// 批量 drain channel 中所有就绪元素到 receive_buffer。
+    fn drain_channel(&mut self) {
+        while let Ok(ordered) = self.receiver.try_recv() {
+            self.receive_buffer.push(ordered);
+        }
+    }
+
     fn try_next_relaxed(&mut self) -> Result<Ordered<T>, TryRecvError> {
         if self.is_stop() {
             return Err(TryRecvError::Disconnected);
         }
 
-        while let Ok(ordered_work) = self.receiver.try_recv() {
-            self.receive_buffer.push(ordered_work)
-        }
+        self.drain_channel();
 
         if let Some(ordered_work) = self.receive_buffer.pop() {
-            Ok(ordered_work)
-        } else if self.pending_count() == 0 {
+            return Ok(ordered_work);
+        }
+
+        // buffer 为空，1ms 超时等待 + 批量 drain
+        match self.receiver.recv_timeout(std::time::Duration::from_millis(1)) {
+            Ok(ordered) => {
+                self.receive_buffer.push(ordered);
+                self.drain_channel();
+                if let Some(top) = self.receive_buffer.pop() {
+                    return Ok(top);
+                }
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                // 超时：检查是否所有工作已完成
+            }
+            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                // Channel 断开，drain 残余
+                self.drain_channel();
+                if let Some(top) = self.receive_buffer.pop() {
+                    return Ok(top);
+                }
+            }
+        }
+
+        if self.pending_count() == 0 {
             Err(TryRecvError::Disconnected)
         } else {
             Err(TryRecvError::Empty)
         }
     }
 
+    /// Strict 模式：优先等待队头（looking_for），超时后降级弹出最高优先级元素。
     fn try_next_strict(&mut self) -> Result<Ordered<T>, TryRecvError> {
         let looking_for = &self.ordered_matcher.looking_for;
-        let timeout = std::time::Duration::from_millis(1);
+        let deadline = Instant::now() + STRICT_WAIT_TIMEOUT;
 
         loop {
             if self.is_stop() {
                 return Err(TryRecvError::Disconnected);
             }
 
+            // 检查 buffer 中是否有目标元素
             let top_ordered = self.receive_buffer.peek();
             if let Some(top_ordered) = top_ordered {
                 if top_ordered.index_path.eq(looking_for) {
@@ -142,22 +176,38 @@ where
                 return Err(TryRecvError::Disconnected);
             }
 
-            match self.receiver.recv_timeout(timeout) {
+            // 超时降级：如果等待太久，弹出 buffer 中最高优先级元素
+            if Instant::now() >= deadline {
+                if self.receive_buffer.peek().is_some() {
+                    let fallback = self.receive_buffer.pop().unwrap();
+                    self.ordered_matcher.advance_past(&fallback);
+                    return Ok(fallback);
+                }
+            }
+
+            // 带超时的阻塞等待
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.receiver.recv_timeout(remaining) {
                 Ok(ordered) => {
                     self.receive_buffer.push(ordered);
                 }
-                Err(err) => match err {
-                    crossbeam::channel::RecvTimeoutError::Timeout => continue,
-                    crossbeam::channel::RecvTimeoutError::Disconnected => {
-                        let top = self.receive_buffer.peek();
-                        if let Some(top_ordered) = top {
-                            if top_ordered.index_path.eq(looking_for) {
-                                break;
-                            }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    let top = self.receive_buffer.peek();
+                    if let Some(top_ordered) = top {
+                        if top_ordered.index_path.eq(looking_for) {
+                            break;
                         }
-                        return Err(TryRecvError::Disconnected);
                     }
-                },
+                    if self.receive_buffer.peek().is_some() {
+                        let fallback = self.receive_buffer.pop().unwrap();
+                        self.ordered_matcher.advance_past(&fallback);
+                        return Ok(fallback);
+                    }
+                    return Err(TryRecvError::Disconnected);
+                }
             }
         }
 

@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::{ClientState, Error, ReadDirSpec, Result, MetaData, get_metadata_ext, MetaDataExt};
 
@@ -44,7 +44,9 @@ pub struct DirEntry<C: ClientState> {
     // True if [`follow_links`] is `true` AND was created from a symlink path.
     follow_link: bool,
     // Origins of symlinks followed to get to this entry.
-    follow_link_ancestors: Arc<Vec<Arc<Path>>>,
+    follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    // Lazily cached full path (parent_path + file_name).
+    cached_path: OnceLock<PathBuf>,
 }
 
 impl<C: ClientState> DirEntry<C> {
@@ -59,7 +61,7 @@ impl<C: ClientState> DirEntry<C> {
         metadata_ext: Option<MetaDataExt>,
         file_name: OsString,
         file_type: FileType,
-        follow_link_ancestors: Arc<Vec<Arc<Path>>>,
+        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
     ) -> Result<Self> {
         let read_children_path: Option<Arc<Path>> = if file_type.is_dir() {
             Some(Arc::from(parent_path.join(&file_name)))
@@ -81,6 +83,7 @@ impl<C: ClientState> DirEntry<C> {
             metadata_ext,
             follow_link: false,
             follow_link_ancestors,
+            cached_path: OnceLock::new(),
         })
     }
 
@@ -91,7 +94,7 @@ impl<C: ClientState> DirEntry<C> {
         read_metadata: bool,
         read_metadata_ext: bool,
         follow_link: bool,
-        follow_link_ancestors: Arc<Vec<Arc<Path>>>,
+        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
     ) -> Result<Self> {
         let metadata = if follow_link {
             fs::metadata(path).map_err(|err| Error::from_path(depth, path.to_owned(), err))?
@@ -145,6 +148,41 @@ impl<C: ClientState> DirEntry<C> {
             metadata_ext: entry_metadata_ext,
             follow_link,
             follow_link_ancestors,
+            cached_path: OnceLock::new(),
+        })
+    }
+
+    /// Create a DirEntry from a std::fs::DirEntry (non-Windows path).
+    pub(crate) fn from_entry(
+        depth: usize,
+        parent_path: Arc<Path>,
+        metadata: Option<MetaData>,
+        metadata_ext: Option<MetaDataExt>,
+        entry: &fs::DirEntry,
+        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    ) -> Result<Self> {
+        let file_type = entry.file_type().map_err(|err| Error::from_io(depth, err))?;
+        let read_children_path: Option<Arc<Path>> = if file_type.is_dir() {
+            Some(Arc::from(entry.path()))
+        } else {
+            None
+        };
+
+        Ok(DirEntry {
+            depth,
+            file_name: entry.file_name(),
+            file_type,
+            parent_path,
+            read_children_path,
+            read_children_error: None,
+            client_state: C::DirEntryState::default(),
+            read_metadata: metadata.is_some(),
+            metadata,
+            read_metadata_ext: metadata_ext.is_some(),
+            metadata_ext,
+            follow_link: false,
+            follow_link_ancestors,
+            cached_path: OnceLock::new(),
         })
     }
 
@@ -180,8 +218,11 @@ impl<C: ClientState> DirEntry<C> {
     /// Path to the file/directory represented by this entry.
     ///
     /// The path is created by joining `parent_path` with `file_name`.
+    /// Result is cached in OnceLock to avoid repeated allocations.
     pub fn path(&self) -> PathBuf {
-        self.parent_path.join(&self.file_name)
+        self.cached_path
+            .get_or_init(|| self.parent_path.join(&self.file_name))
+            .clone()
     }
 
     /// Returns `true` if and only if this entry was created from a symbolic
@@ -262,13 +303,15 @@ impl<C: ClientState> DirEntry<C> {
 
         if dir_entry.file_type.is_dir() {
             let target = fs::read_link(&path).map_err(|err| Error::from_io(self.depth, err))?;
-            for ancestor in self.follow_link_ancestors.iter().rev() {
-                if target.as_path() == ancestor.as_ref() {
-                    return Err(Error::from_loop(
-                        self.depth,
-                        ancestor.as_ref(),
-                        path.as_ref(),
-                    ));
+            if let Some(ancestors) = &self.follow_link_ancestors {
+                for ancestor in ancestors.iter().rev() {
+                    if target.as_path() == ancestor.as_ref() {
+                        return Err(Error::from_loop(
+                            self.depth,
+                            ancestor.as_ref(),
+                            path.as_ref(),
+                        ));
+                    }
                 }
             }
         }

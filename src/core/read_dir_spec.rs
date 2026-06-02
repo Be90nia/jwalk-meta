@@ -23,5 +23,5 @@ pub struct ReadDirSpec<C: ClientState> {
     /// `.gitignore` state to filter entries during the walk.
     pub client_read_state: C::ReadDirState,
     // Origins of symlinks followed to get to this entry.
-    pub(crate) follow_link_ancestors: Arc<Vec<Arc<Path>>>,
+    pub(crate) follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
 }

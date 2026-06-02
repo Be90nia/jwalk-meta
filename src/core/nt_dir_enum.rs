@@ -170,7 +170,7 @@ fn ntstatus_to_io_error(status: i32, funcs: &NtDllFuncs) -> io::Error {
 ///
 /// 返回除 "." 和 ".." 外的所有条目。使用 64KB 缓冲区减少系统调用次数，
 /// 并预分配 Vec 以减少堆重分配。
-pub fn enumerate_dir(path: &Path) -> io::Result<Vec<DirEntryInfo>> {
+pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInfo>> {
     let wide_path = path_to_widestring(path);
     let funcs = ntdll_funcs();
 
@@ -193,7 +193,7 @@ pub fn enumerate_dir(path: &Path) -> io::Result<Vec<DirEntryInfo>> {
 
     let guard = HandleGuard(handle);
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut result = Vec::with_capacity(4096);
+    let mut result = Vec::with_capacity(capacity);
 
     // 首次调用时 RestartScan = 1（重新开始扫描）
     let mut restart_scan: i32 = 1;
@@ -291,6 +291,7 @@ pub fn enumerate_dir(path: &Path) -> io::Result<Vec<DirEntryInfo>> {
 /// 仍然收集到返回的 Vec 中，不遗漏任何条目。
 pub fn enumerate_dir_streaming(
     path: &Path,
+    capacity: usize,
     mut on_subdir: impl FnMut(&DirEntryInfo),
 ) -> io::Result<Vec<DirEntryInfo>> {
     let wide_path = path_to_widestring(path);
@@ -315,7 +316,7 @@ pub fn enumerate_dir_streaming(
 
     let guard = HandleGuard(handle);
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut result = Vec::with_capacity(4096);
+    let mut result = Vec::with_capacity(capacity);
 
     let mut restart_scan: i32 = 1;
 

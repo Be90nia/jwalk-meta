@@ -206,6 +206,9 @@ struct WalkDirOptions<C: ClientState> {
     follow_links: bool,
     read_metadata: bool,
     read_metadata_ext: bool,
+    /// NT 枚举结果 Vec 的预分配容量（仅 Windows 生效）。
+    /// 大目录场景可调高减少重分配，小目录场景可调低节省内存。默认 512。
+    dir_entry_capacity: usize,
     parallelism: Parallelism,
     root_read_dir_state: C::ReadDirState,
     process_read_dir: Option<Arc<ProcessReadDirFunction<C>>>,
@@ -224,13 +227,14 @@ impl<C: ClientState> WalkDirGeneric<C> {
         WalkDirGeneric {
             root: root.as_ref().to_path_buf(),
             options: WalkDirOptions {
-                sort: false,
+            sort: false,
                 min_depth: 0,
                 max_depth: ::std::usize::MAX,
                 skip_hidden: false,
                 follow_links: false,
                 read_metadata: false,
                 read_metadata_ext: false,
+                dir_entry_capacity: 512,
                 parallelism: Parallelism::RayonDefaultPool {
                     busy_timeout: std::time::Duration::from_secs(1),
                 },
@@ -335,6 +339,18 @@ impl<C: ClientState> WalkDirGeneric<C> {
         self
     }
 
+    /// Set the pre-allocated capacity for the directory entry result vector.
+    ///
+    /// This controls the initial `Vec::with_capacity()` used when enumerating
+    /// directory entries via the NT Native API (Windows only). For directories
+    /// with many files (e.g. 10000+), increasing this value reduces Vec
+    /// re-allocations. For small directories, decreasing it saves memory.
+    /// Defaults to `512`.
+    pub fn dir_entry_capacity(mut self, capacity: usize) -> Self {
+        self.options.dir_entry_capacity = capacity;
+        self
+    }
+
     /// Degree of parallelism to use when performing walk. Defaults to
     /// [`Parallelism::RayonDefaultPool`](enum.Parallelism.html#variant.RayonDefaultPool).
     pub fn parallelism(mut self, parallelism: Parallelism) -> Self {
@@ -413,12 +429,13 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
         let follow_links = self.options.follow_links;
         let read_metadata = self.options.read_metadata;
         let read_metadata_ext = self.options.read_metadata_ext;
+        let dir_entry_capacity = self.options.dir_entry_capacity;
         let process_read_dir = self.options.process_read_dir.clone();
         let mut root_read_dir_state = self.options.root_read_dir_state;
-        let follow_link_ancestors = if follow_links {
-            Arc::new(vec![Arc::from(self.root.clone()) as Arc<Path>])
+        let follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>> = if follow_links {
+            Some(Arc::new(vec![Arc::from(self.root.clone()) as Arc<Path>]))
         } else {
-            Arc::new(vec![])
+            None
         };
 
         let root_entry = DirEntry::from_path(
@@ -464,10 +481,14 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                 }
 
                 follow_link_ancestors = if follow_links {
-                    let mut ancestors = Vec::with_capacity(follow_link_ancestors.len() + 1);
-                    ancestors.extend(follow_link_ancestors.iter().cloned());
+                    let existing = follow_link_ancestors
+                        .as_ref()
+                        .map(|a| a.as_ref().as_slice())
+                        .unwrap_or(&[]);
+                    let mut ancestors = Vec::with_capacity(existing.len() + 1);
+                    ancestors.extend(existing.iter().cloned());
                     ancestors.push(path.clone());
-                    Arc::new(ancestors)
+                    Some(Arc::new(ancestors))
                 } else {
                     follow_link_ancestors
                 };
@@ -491,8 +512,17 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                     }
 
                     /// 从 file_attributes (u32) 构造 std::fs::FileType
-                    /// SAFETY: Windows 上 FileType 内部是 [bool; 2] (is_directory, is_symlink)，
-                    /// 以 u16 存储。byte 0 = is_directory, byte 1 = is_symlink。
+                    ///
+                    /// SAFETY: 此 transmute 依赖 std::fs::FileType 的内部布局。
+                    /// 在 Windows 上 FileType 内部存储为 `[bool; 2]`（is_dir, is_symlink），
+                    /// 实际以 `u16` 表示：byte 0 = is_dir, byte 1 = is_symlink。
+                    ///
+                    /// 注意：std 并未保证此布局稳定。如果 Rust 标准库未来更改 FileType
+                    /// 的内部表示，此 transmute 将产生未定义行为。更安全的替代方案是
+                    /// 使用 `From<u32>` 或 `FromRawOs` 等 API（当稳定后）。
+                    ///
+                    /// 依赖的布局定义位于（Rust 1.x）：
+                    /// `library/std/src/sys/pal/windows/fs.rs: FileType { is_directory: bool, is_symlink: bool }`
                     fn file_type_from_attrs(attrs: u32) -> std::fs::FileType {
                         let is_dir = (attrs & 0x10) != 0;  // FILE_ATTRIBUTE_DIRECTORY
                         let is_sym = (attrs & 0x400) != 0;  // FILE_ATTRIBUTE_REPARSE_POINT
@@ -532,7 +562,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                         parent_path: Arc<Path>,
                         read_metadata: bool,
                         read_metadata_ext: bool,
-                        follow_link_ancestors: Arc<Vec<Arc<Path>>>,
+                        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
                     ) -> Result<DirEntry<C>> {
                         let entry_metadata = if read_metadata {
                             Some(make_metadata(info))
@@ -575,7 +605,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                         // subdir_count 递增确保子目录越多的父目录权重越高
                         let parent_weight = ctx.parent_weight;
 
-                        enumerate_dir_streaming(path.as_ref(), |dir_info| {
+                        enumerate_dir_streaming(path.as_ref(), dir_entry_capacity, |dir_info| {
                             // 跳过隐藏目录
                             if skip_hidden && is_hidden(&dir_info.file_name) {
                                 return;
@@ -596,15 +626,15 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                                 follow_link_ancestors: follow_link_ancestors.clone(),
                             };
 
-                            // 优先淹没算法：weight = parent_weight + 已发现子目录数
-                            let weight = parent_weight + streamed_count.get() + 1;
+                            // 优先淹没算法：weight = parent_weight + 已发现子目录数（饱和加法防溢出）
+                            let weight = parent_weight.saturating_add(streamed_count.get() + 1);
                             *child_index_path.indices.last_mut().unwrap() = streamed_count.get();
                             ctx.schedule(Weighted::new(spec, child_index_path.clone(), weight));
                             streamed_count.set(streamed_count.get() + 1);
                         })
                     } else {
                         // ── 非流式路径 ──
-                        enumerate_dir(path.as_ref())
+                        enumerate_dir(path.as_ref(), dir_entry_capacity)
                     };
 
                     let streamed_child_count = streamed_count.get();
@@ -767,6 +797,7 @@ impl<C: ClientState> Clone for WalkDirOptions<C> {
             follow_links: self.follow_links,
             read_metadata: self.read_metadata,
             read_metadata_ext: self.read_metadata_ext,
+            dir_entry_capacity: self.dir_entry_capacity,
             parallelism: self.parallelism.clone(),
             root_read_dir_state: self.root_read_dir_state.clone(),
             process_read_dir: self.process_read_dir.clone(),

@@ -228,19 +228,6 @@ impl error::Error for Error {
             ErrorInner::Loop { .. } | ErrorInner::ThreadpoolBusy => None,
         }
     }
-
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match self.inner {
-            ErrorInner::Io { ref err, .. } => err.description(),
-            ErrorInner::Loop { .. } => "file system loop found",
-            ErrorInner::ThreadpoolBusy => "thread-pool busy",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        self.source()
-    }
 }
 
 impl fmt::Display for Error {
