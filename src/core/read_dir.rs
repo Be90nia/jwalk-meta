@@ -43,18 +43,20 @@ impl<C: ClientState> ReadDir<C> {
         let weight = parent_weight.saturating_add(pipe_size);
 
         // 单遍遍历：跳过已流式部分，直接构造 Weighted<ReadDirSpec>
-        // 避免先收集 (usize, ReadDirSpec) 中间 Vec 再 map 的双遍+双分配开销
+        // 使用 subdir_counter 仅对产生 spec 的子目录递增，
+        // 确保 IndexPath 序列连续（0,1,2,...），而非按 enumerate 索引产生空洞。
         let mut specs = Vec::with_capacity(pipe_size.saturating_sub(skip));
-        for (i, entry_result) in self.results_list.iter().enumerate() {
-            if i < skip {
-                continue;
-            }
+        let mut subdir_counter = 0usize;
+        for entry_result in self.results_list.iter() {
             if let Some(spec) = entry_result
                 .as_ref()
                 .ok()
                 .and_then(|e| e.read_children_spec(self.read_dir_state.clone()))
             {
-                specs.push(Weighted::new(spec, index_path.adding(i), weight));
+                if subdir_counter >= skip {
+                    specs.push(Weighted::new(spec, index_path.adding(subdir_counter), weight));
+                }
+                subdir_counter += 1;
             }
         }
         specs
