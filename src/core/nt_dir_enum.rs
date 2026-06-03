@@ -5,6 +5,7 @@
 
 #![cfg(windows)]
 
+use rayon::prelude::*;
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
@@ -30,6 +31,9 @@ const BUFFER_SIZE: usize = 64 * 1024;
 // 线程本地缓冲区，在 rayon worker 线程间复用 64KB 堆分配。
 thread_local! {
     static TLS_BUFFER: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+    /// UTF-16 编码缓冲区，batch_query_nlinks 中复用 Vec<u16> 避免每次迭代堆分配。
+    /// 文件名通常 <260 字符（MAX_PATH），初始容量 260 足够绝大多数场景。
+    static TLS_WIDE_BUF: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::with_capacity(260));
 }
 
 /// FILE_ID_BOTH_DIR_INFO 的文件信息类编号。
@@ -489,103 +493,152 @@ pub fn enumerate_dir_streaming(
 
 // ── Ext info 批量查询 ────────────────────────────────────────────────
 
-/// 使用 NtQueryInformationByName + FileStatInformation (class 68) 批量查询
+/// 使用 NtQueryInformationByName + FileStatInformation (class 68) 并行查询
 /// 目录条目的 NumberOfLinks。
 ///
 /// 利用已打开的目录句柄 + 相对文件名查询，无需逐文件打开句柄，
 /// 消除 symlink_metadata 的路径解析开销。
+/// 使用 rayon 并行遍历条目，充分利用多核 CPU 减少总耗时。
+///
+/// 线程安全：
+/// - HANDLE 是内核对象引用，多线程并发读操作（NtQueryInformationByName）
+///   是安全的——内核内部维护引用计数，CloseHandle 由 HandleGuard Drop 保证
+///   在所有查询完成后才执行。
+/// - 每个线程独立构造 UNICODE_STRING + OBJECT_ATTRIBUTES + stat_info_buf，
+///   无共享可变状态，无竞锁风险。
 ///
 /// Win10 1709+ 可用。老版本 Windows 或查询失败时 number_of_links 保持 None。
-pub fn batch_query_nlinks(entries: &mut [DirEntryInfo], dir_handle: &HandleGuard) {
+///
+/// `query_file_nlinks`: 是否对普通文件也查询 NumberOfLinks。
+/// 设为 false 时仅对目录条目（FILE_ATTRIBUTE_DIRECTORY）查询，
+/// 文件条目 number_of_links 保持 None，减少约 50% 查询量。
+pub fn batch_query_nlinks(
+    entries: &mut [DirEntryInfo],
+    dir_handle: &HandleGuard,
+    query_file_nlinks: bool,
+) {
     let funcs = ntdll_funcs();
     let query_by_name = match funcs.query_by_name {
         Some(f) => f,
         None => return, // NtQueryInformationByName 不可用（老 Windows），保持 None
     };
 
-    // 预分配 FILE_STAT_INFORMATION 缓冲区（72 字节）
-    let mut stat_info_buf = [0u8; std::mem::size_of::<FILE_STAT_INFORMATION>()];
+    // 将 HANDLE(*mut c_void) 转为 isize 以满足 Send + Sync 约束。
+    // HANDLE 是内核对象引用（整数索引），不是真正的指针，跨线程传递安全。
+    // 生命周期由 HandleGuard 保证——Drop 在所有 rayon 工作完成后才执行。
+    let root_handle_raw = dir_handle.handle() as isize;
 
-    for entry in entries.iter_mut() {
-        // 将文件名转为 UTF-16（UNICODE_STRING 不含 null terminator）
-        let file_name_wide: Vec<u16> = entry.file_name.encode_wide().collect();
-        if file_name_wide.is_empty() {
-            continue;
+    // rayon 并行遍历：每个条目独立查询，线程间无共享可变状态
+    entries.par_iter_mut().for_each(move |entry| {
+        // 条件过滤：仅目录条目需要查询 NumberOfLinks（除非 query_file_nlinks=true）
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        if !query_file_nlinks && (entry.file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+            return; // 非目录条目，跳过查询
         }
 
-        let byte_len = (file_name_wide.len() * 2) as u16;
-        let mut unicode_str = UNICODE_STRING {
-            Length: byte_len,
-            MaximumLength: byte_len,
-            Buffer: file_name_wide.as_ptr() as *mut u16,
-        };
+        // 使用 TLS 缓冲区复用 Vec<u16>，避免每次迭代堆分配
+        // encode_wide → clear + extend 复用已分配容量
+        TLS_WIDE_BUF.with(|buf| {
+            let mut wide_buf = buf.borrow_mut();
+            wide_buf.clear();
+            wide_buf.extend(entry.file_name.encode_wide());
+            if wide_buf.is_empty() {
+                return;
+            }
 
-        let mut obj_attrs = OBJECT_ATTRIBUTES {
-            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: dir_handle.handle(),
-            ObjectName: &mut unicode_str,
-            Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: ptr::null_mut(),
-            SecurityQualityOfService: ptr::null_mut(),
-        };
+            // 每个线程独立的 FILE_STAT_INFORMATION 缓冲区（栈上 72 字节）
+            let mut stat_info_buf = [0u8; std::mem::size_of::<FILE_STAT_INFORMATION>()];
 
-        let mut iosb = IO_STATUS_BLOCK {
-            Status: 0,
-            Information: 0,
-        };
-
-        // SAFETY:
-        // 1. obj_attrs 由有效 dir_handle + 相对文件名构成，NtQueryInformationByName
-        //    使用 RootDirectory + ObjectName 定位文件，无需打开文件句柄
-        // 2. stat_info_buf 大小 = size_of::<FILE_STAT_INFORMATION>() = 72 字节
-        // 3. FILE_STAT_INFORMATION_CLASS = 68 是合法的信息类（Win10 1709+）
-        // 4. unicode_str.Buffer 指向 file_name_wide，在本次迭代内有效
-        let status = unsafe {
-            query_by_name(
-                &mut obj_attrs,
-                &mut iosb,
-                stat_info_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                stat_info_buf.len() as u32,
-                FILE_STAT_INFORMATION_CLASS,
-            )
-        };
-
-        if status == 0 {
-            // SAFETY: NtQueryInformationByName 成功时，缓冲区包含有效的 FILE_STAT_INFORMATION
-            let stat_info = unsafe {
-                std::ptr::read_unaligned(stat_info_buf.as_ptr() as *const FILE_STAT_INFORMATION)
+            let byte_len = (wide_buf.len() * 2) as u16;
+            let mut unicode_str = UNICODE_STRING {
+                Length: byte_len,
+                MaximumLength: byte_len,
+                Buffer: wide_buf.as_ptr() as *mut u16,
             };
-            entry.number_of_links = Some(stat_info.NumberOfLinks);
-        }
-        // 查询失败时保持 number_of_links = None
-    }
+
+            let mut obj_attrs = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: root_handle_raw as HANDLE,
+                ObjectName: &mut unicode_str,
+                Attributes: OBJ_CASE_INSENSITIVE,
+                SecurityDescriptor: ptr::null_mut(),
+                SecurityQualityOfService: ptr::null_mut(),
+            };
+
+            let mut iosb = IO_STATUS_BLOCK {
+                Status: 0,
+                Information: 0,
+            };
+
+            // SAFETY:
+            // 1. obj_attrs 由 root_handle + 相对文件名构成，NtQueryInformationByName
+            //    使用 RootDirectory + ObjectName 定位文件，无需打开文件句柄
+            // 2. stat_info_buf 大小 = size_of::<FILE_STAT_INFORMATION>() = 72 字节
+            // 3. FILE_STAT_INFORMATION_CLASS = 68 是合法的信息类（Win10 1709+）
+            // 4. unicode_str.Buffer 指向 wide_buf（TLS），在 TLS with 块内有效
+            // 5. root_handle 是内核句柄，多线程并发读操作安全
+            let status = unsafe {
+                query_by_name(
+                    &mut obj_attrs,
+                    &mut iosb,
+                    stat_info_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    stat_info_buf.len() as u32,
+                    FILE_STAT_INFORMATION_CLASS,
+                )
+            };
+
+            if status == 0 {
+                // SAFETY: NtQueryInformationByName 成功时，缓冲区包含有效的 FILE_STAT_INFORMATION
+                let stat_info = unsafe {
+                    std::ptr::read_unaligned(stat_info_buf.as_ptr() as *const FILE_STAT_INFORMATION)
+                };
+                entry.number_of_links = Some(stat_info.NumberOfLinks);
+            }
+            // 查询失败时保持 number_of_links = None
+        });
+    });
 }
 
-/// 使用 GetVolumeInformationByHandleW 从目录句柄获取卷序列号。
+/// 一次 GetVolumeInformationByHandleW 调用同时获取文件系统类型和卷序列号。
 ///
-/// 目录内所有文件共享同一卷序列号，只需查询一次。
-/// 失败时返回 None。
-pub fn query_volume_serial(dir_handle: &HandleGuard) -> Option<u32> {
+/// 合并了原先的 detect_fs_type + query_volume_serial 两次调用，
+/// 消除冗余的 GetVolumeInformationByHandleW 系统调用。
+/// 失败时返回 (FsType::Unknown, None)。
+pub fn detect_fs_type_and_vol_serial(dir_handle: &HandleGuard) -> (FsType, Option<u32>) {
+    let mut fs_name_buf = [0u16; 16]; // "NTFS"=4, "FAT32"=5, "exFAT"=5, 加 null 足够
     let mut volume_serial: u32 = 0;
-    // GetVolumeInformationByHandleW 的其他输出参数不需要，传 null
     let success = unsafe {
         GetVolumeInformationByHandleW(
             dir_handle.handle(),
-            ptr::null_mut(),       // lpVolumeNameBuffer
-            0,                     // nVolumeNameLength
-            &mut volume_serial,    // lpVolumeSerialNumber
-            ptr::null_mut(),       // lpMaximumComponentLength
-            ptr::null_mut(),       // lpFileSystemFlags
-            ptr::null_mut(),       // lpFileSystemNameBuffer
-            0,                     // nFileSystemNameLength
+            ptr::null_mut(),               // lpVolumeNameBuffer
+            0,                             // nVolumeNameLength
+            &mut volume_serial,            // lpVolumeSerialNumber
+            ptr::null_mut(),               // lpMaximumComponentLength
+            ptr::null_mut(),               // lpFileSystemFlags
+            fs_name_buf.as_mut_ptr(),      // lpFileSystemNameBuffer
+            fs_name_buf.len() as u32,      // nFileSystemNameLength
         )
     };
 
-    if success != 0 {
-        Some(volume_serial)
-    } else {
-        None
+    if success == 0 {
+        return (FsType::Unknown, None);
     }
+
+    // 找到 null terminator 的位置
+    let len = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(fs_name_buf.len());
+    let fs_name = OsString::from_wide(&fs_name_buf[..len]);
+    // ASCII 大写比较（Windows 文件系统名称始终为 ASCII 大写）
+    let fs_type = match fs_name.to_string_lossy().as_ref() {
+        "NTFS" => FsType::Ntfs,
+        "ReFS" => FsType::Refs,
+        "FAT32" => FsType::Fat32,
+        "exFAT" => FsType::ExFat,
+        "FAT" => FsType::Fat32,   // FAT12/FAT16 也无硬链接
+        "FAT16" => FsType::Fat32, // 同上
+        _ => FsType::Unknown,
+    };
+
+    (fs_type, Some(volume_serial))
 }
 
 // ── 文件系统类型检测 ────────────────────────────────────────────────────
@@ -614,40 +667,4 @@ impl FsType {
     }
 }
 
-/// 使用 GetVolumeInformationByHandleW 从目录句柄检测文件系统类型。
-///
-/// 通过 lpFileSystemNameBuffer 获取文件系统名称（如 "NTFS", "FAT32"），
-/// 转为 FsType 枚举。失败时返回 FsType::Unknown（保守策略：逐文件查询）。
-pub fn detect_fs_type(dir_handle: &HandleGuard) -> FsType {
-    let mut fs_name_buf = [0u16; 16]; // "NTFS"=4, "FAT32"=5, "exFAT"=5, 加 null 足够
-    let success = unsafe {
-        GetVolumeInformationByHandleW(
-            dir_handle.handle(),
-            ptr::null_mut(),               // lpVolumeNameBuffer
-            0,                             // nVolumeNameLength
-            ptr::null_mut(),               // lpVolumeSerialNumber
-            ptr::null_mut(),               // lpMaximumComponentLength
-            ptr::null_mut(),               // lpFileSystemFlags
-            fs_name_buf.as_mut_ptr(),      // lpFileSystemNameBuffer
-            fs_name_buf.len() as u32,      // nFileSystemNameLength
-        )
-    };
 
-    if success == 0 {
-        return FsType::Unknown;
-    }
-
-    // 找到 null terminator 的位置
-    let len = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(fs_name_buf.len());
-    let fs_name = OsString::from_wide(&fs_name_buf[..len]);
-    // ASCII 大写比较（Windows 文件系统名称始终为 ASCII 大写）
-    match fs_name.to_string_lossy().as_ref() {
-        "NTFS" => FsType::Ntfs,
-        "ReFS" => FsType::Refs,
-        "FAT32" => FsType::Fat32,
-        "exFAT" => FsType::ExFat,
-        "FAT" => FsType::Fat32,   // FAT12/FAT16 也无硬链接
-        "FAT16" => FsType::Fat32, // 同上
-_ => FsType::Unknown,
-    }
-}

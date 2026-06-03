@@ -37,7 +37,7 @@ pub(crate) use read_dir_iter::StreamingContext;
 #[cfg(windows)]
 pub(crate) use nt_dir_enum::{
     enumerate_dir, enumerate_dir_streaming, DirEntryInfo, batch_query_nlinks,
-    query_volume_serial, detect_fs_type,
+    detect_fs_type_and_vol_serial,
 };
 pub use ordered_queue::Ordering;
 

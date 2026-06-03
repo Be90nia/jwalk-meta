@@ -206,6 +206,10 @@ struct WalkDirOptions<C: ClientState> {
     follow_links: bool,
     read_metadata: bool,
     read_metadata_ext: bool,
+    /// 查询硬链接信息（NumberOfLinks + VolumeSerialNumber）。
+    /// 需要额外的 O(N) syscall（NtQueryInformationByName），仅 Windows 生效。
+    /// 默认 false。read_metadata_ext=true 时此选项才有意义。
+    read_hardlink_info: bool,
     /// NT 枚举结果 Vec 的预分配容量（仅 Windows 生效）。
     /// 大目录场景可调高减少重分配，小目录场景可调低节省内存。默认 512。
     dir_entry_capacity: usize,
@@ -234,6 +238,7 @@ impl<C: ClientState> WalkDirGeneric<C> {
                 follow_links: false,
                 read_metadata: false,
                 read_metadata_ext: false,
+                read_hardlink_info: false,
                 dir_entry_capacity: 512,
                 parallelism: Parallelism::RayonDefaultPool {
                     busy_timeout: std::time::Duration::from_secs(1),
@@ -339,6 +344,18 @@ impl<C: ClientState> WalkDirGeneric<C> {
         self
     }
 
+    /// 查询硬链接信息（NumberOfLinks + VolumeSerialNumber）。
+    ///
+    /// 启用后，Windows 路径会额外调用 `NtQueryInformationByName` (class 68)
+    /// 获取每个条目的 `number_of_links`，以及 `GetVolumeInformationByHandleW`
+    /// 获取 `volume_serial_number`。对于大目录（10K+ 条目），这会增加显著开销。
+    ///
+    /// 仅在 `read_metadata_ext(true)` 时生效。默认 `false`。
+    pub fn read_hardlink_info(mut self, read_hardlink_info: bool) -> Self {
+        self.options.read_hardlink_info = read_hardlink_info;
+        self
+    }
+
     /// Set the pre-allocated capacity for the directory entry result vector.
     ///
     /// This controls the initial `Vec::with_capacity()` used when enumerating
@@ -426,6 +443,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
         let follow_links = self.options.follow_links;
         let read_metadata = self.options.read_metadata;
         let read_metadata_ext = self.options.read_metadata_ext;
+        let read_hardlink_info = self.options.read_hardlink_info;
         let dir_entry_capacity = self.options.dir_entry_capacity;
         let process_read_dir = self.options.process_read_dir.clone();
         let mut root_read_dir_state = self.options.root_read_dir_state;
@@ -505,6 +523,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                         follow_links,
                         read_metadata,
                         read_metadata_ext,
+                        read_hardlink_info,
                         dir_entry_capacity,
                         skip_hidden,
                         sort,
@@ -525,6 +544,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                         follow_links,
                         read_metadata,
                         read_metadata_ext,
+                        read_hardlink_info,
                         skip_hidden,
                         sort,
                         follow_link_ancestors,
@@ -547,6 +567,7 @@ impl<C: ClientState> Clone for WalkDirOptions<C> {
             follow_links: self.follow_links,
             read_metadata: self.read_metadata,
             read_metadata_ext: self.read_metadata_ext,
+            read_hardlink_info: self.read_hardlink_info,
             dir_entry_capacity: self.dir_entry_capacity,
             parallelism: self.parallelism.clone(),
             root_read_dir_state: self.root_read_dir_state.clone(),
@@ -700,15 +721,18 @@ mod read_dir_windows_helpers {
     /// 优先使用 DirEntryInfo 中预计算的 number_of_links 和 volume_serial_number
     /// （由 NtQueryInformationByName + FileStatInformation 批量查询填充）。
     /// 当预计算值不可用时（老 Windows 或查询失败），使用 Win32 fallback 路径。
+    /// 仅在 read_hardlink_info=true 时触发 fallback（需要额外 fs::symlink_metadata）。
     pub(super) fn make_metadata_ext(
         info: &DirEntryInfo,
         win32_fallback_path: Option<&Path>,
+        read_hardlink_info: bool,
     ) -> MetaDataExt {
         // 优先使用 NT API 批量查询的预计算值
         // P4: 当任一预计算值缺失时，只调用1次 symlink_metadata（之前调用2次）
+        // 仅 read_hardlink_info=true 时触发 fallback（需要额外 syscall）
         let (number_of_links, volume_serial_number) = {
-            let need_nlink = info.number_of_links.is_none();
-            let need_vol = info.volume_serial_number.is_none();
+            let need_nlink = read_hardlink_info && info.number_of_links.is_none();
+            let need_vol = read_hardlink_info && info.volume_serial_number.is_none();
             if need_nlink || need_vol {
                 if let Some(path) = win32_fallback_path {
                     if let Ok(m) = std::fs::symlink_metadata(path) {
@@ -743,7 +767,8 @@ MetaDataExt {
         parent_path: Arc<Path>,
         read_metadata: bool,
         read_metadata_ext: bool,
-follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
+        read_hardlink_info: bool,
+    follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     ) -> Result<DirEntry<C>> {
         let entry_metadata = if read_metadata {
             Some(make_metadata(info))
@@ -751,7 +776,7 @@ follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
             None
         };
         let entry_metadata_ext = if read_metadata_ext {
-            Some(make_metadata_ext(info, None))
+            Some(make_metadata_ext(info, None, read_hardlink_info))
         } else {
             None
         };
@@ -790,6 +815,7 @@ fn read_dir_windows<C: ClientState>(
     follow_links: bool,
     read_metadata: bool,
     read_metadata_ext: bool,
+    read_hardlink_info: bool,
     dir_entry_capacity: usize,
     skip_hidden: bool,
     sort: bool,
@@ -798,7 +824,7 @@ fn read_dir_windows<C: ClientState>(
     process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
     streaming_ctx: Option<crate::core::StreamingContext<C>>,
 ) -> Result<ReadDir<C>> {
-    use crate::core::{enumerate_dir, enumerate_dir_streaming, batch_query_nlinks, query_volume_serial, detect_fs_type};
+    use crate::core::{enumerate_dir, enumerate_dir_streaming, batch_query_nlinks, detect_fs_type_and_vol_serial};
     use read_dir_windows_helpers::*;
 
     // 选择枚举策略：流式 vs 非流式
@@ -884,20 +910,20 @@ fn read_dir_windows<C: ClientState>(
         }
     };
 
-    // 批量查询 ext info：NumberOfLinks + VolumeSerialNumber
-    // 非 ext 模式下跳过，尽早释放 HandleGuard
-    if read_metadata_ext {
+    // 批量查询硬链接信息：NumberOfLinks + VolumeSerialNumber
+    // 仅在 read_metadata_ext + read_hardlink_info 时触发，避免 O(N) syscall 开销
+    if read_metadata_ext && read_hardlink_info {
+        // 一次 GetVolumeInformationByHandleW 同时获取 fs_type + vol_serial
+        let (fs_type, vol_serial) = detect_fs_type_and_vol_serial(&guard);
         // 检测文件系统类型：FAT32/exFAT 不支持硬链接，NumberOfLinks 恒为 1
         // 跳过逐文件 NtQueryInformationByName 查询，节省 N 次 syscall
-        let fs_type = detect_fs_type(&guard);
         if fs_type.is_fat_family() {
             for entry in entries.iter_mut() {
                 entry.number_of_links = Some(1);
             }
         } else {
-            batch_query_nlinks(&mut entries, &guard);
+            batch_query_nlinks(&mut entries, &guard, false); // 仅查询目录的 nlink，文件保持 None
         }
-        let vol_serial = query_volume_serial(&guard);
         if let Some(vs) = vol_serial {
             for entry in entries.iter_mut() {
                 entry.volume_serial_number = Some(vs);
@@ -920,6 +946,7 @@ fn read_dir_windows<C: ClientState>(
                 path.clone(),
                 read_metadata,
                 read_metadata_ext,
+                read_hardlink_info,
                 follow_link_ancestors.clone(),
             ) {
                 Ok(e) => e,
@@ -962,6 +989,7 @@ fn read_dir_unix<C: ClientState>(
     follow_links: bool,
     read_metadata: bool,
     read_metadata_ext: bool,
+    read_hardlink_info: bool,
     skip_hidden: bool,
     sort: bool,
     follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
