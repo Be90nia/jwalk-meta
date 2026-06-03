@@ -695,25 +695,28 @@ mod read_dir_windows_helpers {
 
     /// 从 DirEntryInfo 构造 MetaDataExt。
     ///
-    /// NT API 路径下 `number_of_links` 和 `volume_serial_number` 不可用，
-    /// 需要额外调用 Win32 API (`GetFileInformationByHandle`) 获取。
-    /// 当 `win32_fallback_path` 为 `Some` 时，使用 Win32 元数据填充这些字段。
+    /// 优先使用 DirEntryInfo 中预计算的 number_of_links 和 volume_serial_number
+    /// （由 NtQueryInformationByName + FileStatInformation 批量查询填充）。
+    /// 当预计算值不可用时（老 Windows 或查询失败），使用 Win32 fallback 路径。
     pub(super) fn make_metadata_ext(
         info: &DirEntryInfo,
         win32_fallback_path: Option<&Path>,
     ) -> MetaDataExt {
-        let (volume_serial_number, number_of_links) = if let Some(path) = win32_fallback_path {
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata) => {
-                    use crate::core::get_metadata_ext;
-                    let ext = get_metadata_ext(&metadata);
-                    (ext.volume_serial_number, ext.number_of_links)
-                }
-                Err(_) => (None, None),
-            }
-        } else {
-            (None, None)
-        };
+        // 优先使用 NT API 批量查询的预计算值
+        let number_of_links = info.number_of_links.or_else(|| {
+            win32_fallback_path.and_then(|path| {
+                std::fs::symlink_metadata(path).ok().and_then(|m| {
+                    crate::core::get_metadata_ext(&m).number_of_links
+                })
+            })
+        });
+        let volume_serial_number = info.volume_serial_number.or_else(|| {
+            win32_fallback_path.and_then(|path| {
+                std::fs::symlink_metadata(path).ok().and_then(|m| {
+                    crate::core::get_metadata_ext(&m).volume_serial_number
+                })
+            })
+        });
 
         MetaDataExt {
             file_attributes: info.file_attributes,
@@ -737,15 +740,8 @@ mod read_dir_windows_helpers {
         } else {
             None
         };
-        // 当 read_metadata_ext 为 true 时，构建完整路径用于 Win32 fallback，
-        // 以获取 NT API 无法提供的 number_of_links 和 volume_serial_number。
-        let win32_fallback_path = if read_metadata_ext {
-            Some(parent_path.join(&info.file_name))
-        } else {
-            None
-        };
         let entry_metadata_ext = if read_metadata_ext {
-            Some(make_metadata_ext(info, win32_fallback_path.as_deref()))
+            Some(make_metadata_ext(info, None))
         } else {
             None
         };
@@ -792,7 +788,7 @@ fn read_dir_windows<C: ClientState>(
     process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
     streaming_ctx: Option<crate::core::StreamingContext<C>>,
 ) -> Result<ReadDir<C>> {
-    use crate::core::{enumerate_dir, enumerate_dir_streaming};
+    use crate::core::{enumerate_dir, enumerate_dir_streaming, batch_query_nlinks, query_volume_serial};
     use read_dir_windows_helpers::*;
 
     // 选择枚举策略：流式 vs 非流式
@@ -863,8 +859,8 @@ fn read_dir_windows<C: ClientState>(
 
     let streamed_child_count = streamed_count.get();
 
-    let entries = match entries_result {
-        Ok(e) => e,
+    let (guard, mut entries) = match entries_result {
+        Ok((guard, entries)) => (guard, entries),
         Err(err) => {
             // 如果流式枚举在出错前已调度了子目录，必须报告已调度数量，
             // 否则 OrderedQueue 的 pending_count 会不匹配，导致消费者永远挂起。
@@ -877,6 +873,20 @@ fn read_dir_windows<C: ClientState>(
             return Err(Error::from_path(0, path.to_path_buf(), err));
         }
     };
+
+    // 批量查询 ext info：NtQueryInformationByName + FileStatInformation
+    // 获取 NumberOfLinks + GetVolumeInformationByHandleW 获取 VolumeSerialNumber
+    // 非 ext 模式下跳过，尽早释放 HandleGuard
+    if read_metadata_ext {
+        batch_query_nlinks(&mut entries, &guard);
+        let vol_serial = query_volume_serial(&guard);
+        if let Some(vs) = vol_serial {
+            for entry in entries.iter_mut() {
+                entry.volume_serial_number = Some(vs);
+            }
+        }
+    }
+    drop(guard); // 尽早关闭目录句柄，释放内核资源
 
     // 构造 DirEntry 列表
     let mut dir_entry_results: Vec<_> = entries

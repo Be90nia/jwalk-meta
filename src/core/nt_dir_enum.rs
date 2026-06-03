@@ -20,6 +20,7 @@ use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
 use winapi::um::winnt::{
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
+use winapi::um::fileapi::GetVolumeInformationByHandleW;
 
 /// NtQueryDirectoryFileEx 的 64KB I/O 缓冲区，减少系统调用次数。
 /// 本地磁盘 64KB 已足够（单次系统调用微秒级延迟）。
@@ -72,6 +73,55 @@ struct IO_STATUS_BLOCK {
     Information: usize,
 }
 
+/// NT UNICODE_STRING，用于 OBJECT_ATTRIBUTES 中的文件名。
+/// 注意：Length 和 MaximumLength 以字节为单位（不含 null terminator）。
+#[repr(C)]
+#[allow(non_snake_case)]
+struct UNICODE_STRING {
+    Length: u16,
+    MaximumLength: u16,
+    Buffer: *mut u16,
+}
+
+/// NT OBJECT_ATTRIBUTES，用于 NtQueryInformationByName。
+/// RootDirectory 为已打开的目录句柄，ObjectName 为相对文件名。
+#[repr(C)]
+#[allow(non_snake_case)]
+struct OBJECT_ATTRIBUTES {
+    Length: u32,
+    RootDirectory: HANDLE,
+    ObjectName: *mut UNICODE_STRING,
+    Attributes: u32,
+    SecurityDescriptor: *mut std::ffi::c_void,
+    SecurityQualityOfService: *mut std::ffi::c_void,
+}
+
+/// NtQueryInformationByName 返回的文件统计信息 (class 68)。
+/// Win10 1709+ 可用。包含 FileId + NumberOfLinks + 时间戳 + 文件属性，
+/// 无需打开文件句柄即可查询。
+#[repr(C)]
+#[allow(non_snake_case)]
+struct FILE_STAT_INFORMATION {
+    FileId: i64,
+    CreationTime: i64,
+    LastAccessTime: i64,
+    LastWriteTime: i64,
+    ChangeTime: i64,
+    AllocationSize: i64,
+    EndOfFile: i64,
+    FileAttributes: u32,
+    ReparseTag: u32,
+    NumberOfLinks: u32,
+    EffectiveAccess: u32,
+}
+
+/// FILE_STAT_INFORMATION 的信息类编号 (class 68)。
+/// Win10 1709+ 可用。
+const FILE_STAT_INFORMATION_CLASS: u32 = 68;
+
+/// OBJECT_ATTRIBUTES 的 OBJ_CASE_INSENSITIVE 标志。
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+
 // ── 动态加载 ntdll ─────────────────────────────────────────────────────
 
 /// NtQueryDirectoryFileEx 函数签名。
@@ -93,10 +143,23 @@ type NtQueryDirectoryFileExFn = unsafe extern "system" fn(
 /// RtlNtStatusToDosError 函数签名，用于将 NTSTATUS 转换为 Win32 错误码。
 type RtlNtStatusToDosErrorFn = unsafe extern "system" fn(status: i32) -> u32;
 
+/// NtQueryInformationByName 函数签名 (Win10 1709+)。
+/// 使用 RootDirectory + FileName 查询文件信息，无需打开文件句柄。
+#[allow(non_snake_case)]
+type NtQueryInformationByNameFn = unsafe extern "system" fn(
+    ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+    IoStatusBlock: *mut IO_STATUS_BLOCK,
+    FileInformation: *mut std::ffi::c_void,
+    Length: u32,
+    FileInformationClass: u32,
+) -> i32;
+
 /// 从 ntdll.dll 动态加载的函数指针集合。
 struct NtDllFuncs {
     query_dir: NtQueryDirectoryFileExFn,
     status_to_win32: RtlNtStatusToDosErrorFn,
+    /// NtQueryInformationByName (Win10 1709+)。Option 因为老版本 Windows 不存在。
+    query_by_name: Option<NtQueryInformationByNameFn>,
 }
 
 /// 懒加载 ntdll 函数指针。失败时 panic（启动时一次性初始化）。
@@ -126,9 +189,18 @@ fn ntdll_funcs() -> &'static NtDllFuncs {
             panic!("nt_dir_enum: 无法获取 ntdll 函数地址");
         }
 
+        // NtQueryInformationByName (Win10 1709+)：可选加载，老版本 Windows 不存在
+        let query_by_name_ptr = GetProcAddress(module, b"NtQueryInformationByName\0".as_ptr() as *const i8);
+        let query_by_name = if query_by_name_ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute(query_by_name_ptr))
+        };
+
         NtDllFuncs {
             query_dir: std::mem::transmute(query_dir_ptr),
             status_to_win32: std::mem::transmute(status_to_win32_ptr),
+            query_by_name,
         }
     })
 }
@@ -136,7 +208,14 @@ fn ntdll_funcs() -> &'static NtDllFuncs {
 // ── RAII 句柄守卫 ──────────────────────────────────────────────────────
 
 /// RAII 守卫，Drop 时自动 CloseHandle。用于 CreateFileW 返回的句柄。
-struct HandleGuard(HANDLE);
+pub(crate) struct HandleGuard(HANDLE);
+
+impl HandleGuard {
+    /// 返回内部句柄，用于批量查询等操作。
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.0
+    }
+}
 
 impl Drop for HandleGuard {
     fn drop(&mut self) {
@@ -160,6 +239,13 @@ pub struct DirEntryInfo {
     pub last_write_time: i64,
     pub last_access_time: i64,
     pub file_id: u64,
+    /// 硬链接数。NT API 批量枚举不提供此字段，
+    /// 需通过 NtQueryInformationByName + FileStatInformation (class 68) 查询。
+    /// Win10 1709+ 可用；老版本 Windows 或查询失败时为 None。
+    pub number_of_links: Option<u32>,
+    /// 卷序列号。通过 GetVolumeInformationByHandleW 从目录句柄获取一次。
+    /// 所有条目共享同一值（同一目录内的文件属于同一卷）。
+    pub volume_serial_number: Option<u32>,
 }
 
 // ── 辅助函数 ───────────────────────────────────────────────────────────
@@ -338,9 +424,11 @@ fn enumerate_dir_core_inner(
 
 /// 使用 NtQueryDirectoryFileEx 批量枚举目录中的所有文件和子目录。
 ///
-/// 返回除 "." 和 ".." 外的所有条目。使用 64KB 缓冲区减少系统调用次数，
-/// 并预分配 Vec 以减少堆重分配。
-pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInfo>> {
+/// 返回除 "." 和 ".." 外的所有条目，以及保持打开的目录句柄。
+/// 目录句柄用于后续的 ext info 批量查询（NtQueryInformationByName），
+/// 句柄在 HandleGuard drop 时自动关闭。
+/// 使用 64KB 缓冲区减少系统调用次数，并预分配 Vec 以减少堆重分配。
+pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<(HandleGuard, Vec<DirEntryInfo>)> {
     let funcs = ntdll_funcs();
     let guard = open_dir_handle(path)?;
     let mut result = Vec::with_capacity(capacity);
@@ -354,21 +442,24 @@ pub fn enumerate_dir(path: &Path, capacity: usize) -> io::Result<Vec<DirEntryInf
             last_write_time: entry.LastWriteTime,
             last_access_time: entry.LastAccessTime,
             file_id: entry.FileId as u64,
+            number_of_links: None,
+            volume_serial_number: None,
         });
     })?;
 
-    Ok(result)
+    Ok((guard, result))
 }
 
 /// 使用 NtQueryDirectoryFileEx 批量枚举，并对每个子目录调用回调实现流式分发。
 ///
 /// 子目录通过回调立即分发（无需等待完整枚举），所有条目（文件和子目录）
 /// 仍然收集到返回的 Vec 中，不遗漏任何条目。
+/// 返回保持打开的目录句柄，用于后续 ext info 批量查询。
 pub fn enumerate_dir_streaming(
     path: &Path,
     capacity: usize,
     mut on_subdir: impl FnMut(&DirEntryInfo),
-) -> io::Result<Vec<DirEntryInfo>> {
+) -> io::Result<(HandleGuard, Vec<DirEntryInfo>)> {
     let funcs = ntdll_funcs();
     let guard = open_dir_handle(path)?;
     let mut result = Vec::with_capacity(capacity);
@@ -382,6 +473,8 @@ pub fn enumerate_dir_streaming(
             last_write_time: entry.LastWriteTime,
             last_access_time: entry.LastAccessTime,
             file_id: entry.FileId as u64,
+            number_of_links: None,
+            volume_serial_number: None,
         };
 
         // FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -392,5 +485,106 @@ pub fn enumerate_dir_streaming(
         result.push(info);
     })?;
 
-    Ok(result)
+    Ok((guard, result))
+}
+
+// ── Ext info 批量查询 ────────────────────────────────────────────────
+
+/// 使用 NtQueryInformationByName + FileStatInformation (class 68) 批量查询
+/// 目录条目的 NumberOfLinks。
+///
+/// 利用已打开的目录句柄 + 相对文件名查询，无需逐文件打开句柄，
+/// 消除 symlink_metadata 的路径解析开销。
+///
+/// Win10 1709+ 可用。老版本 Windows 或查询失败时 number_of_links 保持 None。
+pub fn batch_query_nlinks(entries: &mut [DirEntryInfo], dir_handle: &HandleGuard) {
+    let funcs = ntdll_funcs();
+    let query_by_name = match funcs.query_by_name {
+        Some(f) => f,
+        None => return, // NtQueryInformationByName 不可用（老 Windows），保持 None
+    };
+
+    // 预分配 FILE_STAT_INFORMATION 缓冲区（72 字节）
+    let mut stat_info_buf = [0u8; std::mem::size_of::<FILE_STAT_INFORMATION>()];
+
+    for entry in entries.iter_mut() {
+        // 将文件名转为 UTF-16（UNICODE_STRING 不含 null terminator）
+        let file_name_wide: Vec<u16> = entry.file_name.encode_wide().collect();
+        if file_name_wide.is_empty() {
+            continue;
+        }
+
+        let byte_len = (file_name_wide.len() * 2) as u16;
+        let mut unicode_str = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: file_name_wide.as_ptr() as *mut u16,
+        };
+
+        let mut obj_attrs = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir_handle.handle(),
+            ObjectName: &mut unicode_str,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+
+        let mut iosb = IO_STATUS_BLOCK {
+            Status: 0,
+            Information: 0,
+        };
+
+        // SAFETY:
+        // 1. obj_attrs 由有效 dir_handle + 相对文件名构成，NtQueryInformationByName
+        //    使用 RootDirectory + ObjectName 定位文件，无需打开文件句柄
+        // 2. stat_info_buf 大小 = size_of::<FILE_STAT_INFORMATION>() = 72 字节
+        // 3. FILE_STAT_INFORMATION_CLASS = 68 是合法的信息类（Win10 1709+）
+        // 4. unicode_str.Buffer 指向 file_name_wide，在本次迭代内有效
+        let status = unsafe {
+            query_by_name(
+                &mut obj_attrs,
+                &mut iosb,
+                stat_info_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                stat_info_buf.len() as u32,
+                FILE_STAT_INFORMATION_CLASS,
+            )
+        };
+
+        if status == 0 {
+            // SAFETY: NtQueryInformationByName 成功时，缓冲区包含有效的 FILE_STAT_INFORMATION
+            let stat_info = unsafe {
+                std::ptr::read_unaligned(stat_info_buf.as_ptr() as *const FILE_STAT_INFORMATION)
+            };
+            entry.number_of_links = Some(stat_info.NumberOfLinks);
+        }
+        // 查询失败时保持 number_of_links = None
+    }
+}
+
+/// 使用 GetVolumeInformationByHandleW 从目录句柄获取卷序列号。
+///
+/// 目录内所有文件共享同一卷序列号，只需查询一次。
+/// 失败时返回 None。
+pub fn query_volume_serial(dir_handle: &HandleGuard) -> Option<u32> {
+    let mut volume_serial: u32 = 0;
+    // GetVolumeInformationByHandleW 的其他输出参数不需要，传 null
+    let success = unsafe {
+        GetVolumeInformationByHandleW(
+            dir_handle.handle(),
+            ptr::null_mut(),       // lpVolumeNameBuffer
+            0,                     // nVolumeNameLength
+            &mut volume_serial,    // lpVolumeSerialNumber
+            ptr::null_mut(),       // lpMaximumComponentLength
+            ptr::null_mut(),       // lpFileSystemFlags
+            ptr::null_mut(),       // lpFileSystemNameBuffer
+            0,                     // nFileSystemNameLength
+        )
+    };
+
+    if success != 0 {
+        Some(volume_serial)
+    } else {
+        None
+    }
 }

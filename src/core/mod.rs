@@ -35,7 +35,7 @@ pub(crate) use weighted::Weighted;
 pub(crate) use read_dir_iter::StreamingContext;
 
 #[cfg(windows)]
-pub(crate) use nt_dir_enum::{enumerate_dir, enumerate_dir_streaming, DirEntryInfo};
+pub(crate) use nt_dir_enum::{enumerate_dir, enumerate_dir_streaming, DirEntryInfo, batch_query_nlinks, query_volume_serial};
 pub use ordered_queue::Ordering;
 
 use crate::{ClientState, Parallelism};
