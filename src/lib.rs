@@ -798,7 +798,7 @@ fn read_dir_windows<C: ClientState>(
     process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
     streaming_ctx: Option<crate::core::StreamingContext<C>>,
 ) -> Result<ReadDir<C>> {
-    use crate::core::{enumerate_dir, enumerate_dir_streaming, batch_query_nlinks, query_volume_serial};
+    use crate::core::{enumerate_dir, enumerate_dir_streaming, batch_query_nlinks, query_volume_serial, detect_fs_type};
     use read_dir_windows_helpers::*;
 
     // 选择枚举策略：流式 vs 非流式
@@ -884,11 +884,19 @@ fn read_dir_windows<C: ClientState>(
         }
     };
 
-    // 批量查询 ext info：NtQueryInformationByName + FileStatInformation
-    // 获取 NumberOfLinks + GetVolumeInformationByHandleW 获取 VolumeSerialNumber
+    // 批量查询 ext info：NumberOfLinks + VolumeSerialNumber
     // 非 ext 模式下跳过，尽早释放 HandleGuard
     if read_metadata_ext {
-        batch_query_nlinks(&mut entries, &guard);
+        // 检测文件系统类型：FAT32/exFAT 不支持硬链接，NumberOfLinks 恒为 1
+        // 跳过逐文件 NtQueryInformationByName 查询，节省 N 次 syscall
+        let fs_type = detect_fs_type(&guard);
+        if fs_type.is_fat_family() {
+            for entry in entries.iter_mut() {
+                entry.number_of_links = Some(1);
+            }
+        } else {
+            batch_query_nlinks(&mut entries, &guard);
+        }
         let vol_serial = query_volume_serial(&guard);
         if let Some(vs) = vol_serial {
             for entry in entries.iter_mut() {

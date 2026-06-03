@@ -477,7 +477,6 @@ pub fn enumerate_dir_streaming(
             volume_serial_number: None,
         };
 
-        // FILE_ATTRIBUTE_DIRECTORY = 0x10
         if info.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
             on_subdir(&info);
         }
@@ -586,5 +585,69 @@ pub fn query_volume_serial(dir_handle: &HandleGuard) -> Option<u32> {
         Some(volume_serial)
     } else {
         None
+    }
+}
+
+// ── 文件系统类型检测 ────────────────────────────────────────────────────
+
+/// Windows 文件系统类型，用于决定 number_of_links 查询策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsType {
+    /// NTFS — 支持硬链接，需要逐文件查询 NumberOfLinks
+    Ntfs,
+    /// ReFS — 支持硬链接，需要逐文件查询 NumberOfLinks
+    Refs,
+    /// FAT32 — 不支持硬链接，NumberOfLinks 恒为 1
+    Fat32,
+    /// exFAT — 不支持硬链接，NumberOfLinks 恒为 1
+    ExFat,
+    /// 未知文件系统 — 保守策略，逐文件查询
+    Unknown,
+}
+
+impl FsType {
+    /// FAT 系列（FAT32/exFAT）不支持硬链接，NumberOfLinks 恒为 1。
+    /// 可以安全跳过 batch_query_nlinks，直接设 nlink=1。
+    #[inline]
+    pub fn is_fat_family(self) -> bool {
+        matches!(self, FsType::Fat32 | FsType::ExFat)
+    }
+}
+
+/// 使用 GetVolumeInformationByHandleW 从目录句柄检测文件系统类型。
+///
+/// 通过 lpFileSystemNameBuffer 获取文件系统名称（如 "NTFS", "FAT32"），
+/// 转为 FsType 枚举。失败时返回 FsType::Unknown（保守策略：逐文件查询）。
+pub fn detect_fs_type(dir_handle: &HandleGuard) -> FsType {
+    let mut fs_name_buf = [0u16; 16]; // "NTFS"=4, "FAT32"=5, "exFAT"=5, 加 null 足够
+    let success = unsafe {
+        GetVolumeInformationByHandleW(
+            dir_handle.handle(),
+            ptr::null_mut(),               // lpVolumeNameBuffer
+            0,                             // nVolumeNameLength
+            ptr::null_mut(),               // lpVolumeSerialNumber
+            ptr::null_mut(),               // lpMaximumComponentLength
+            ptr::null_mut(),               // lpFileSystemFlags
+            fs_name_buf.as_mut_ptr(),      // lpFileSystemNameBuffer
+            fs_name_buf.len() as u32,      // nFileSystemNameLength
+        )
+    };
+
+    if success == 0 {
+        return FsType::Unknown;
+    }
+
+    // 找到 null terminator 的位置
+    let len = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(fs_name_buf.len());
+    let fs_name = OsString::from_wide(&fs_name_buf[..len]);
+    // ASCII 大写比较（Windows 文件系统名称始终为 ASCII 大写）
+    match fs_name.to_string_lossy().as_ref() {
+        "NTFS" => FsType::Ntfs,
+        "ReFS" => FsType::Refs,
+        "FAT32" => FsType::Fat32,
+        "exFAT" => FsType::ExFat,
+        "FAT" => FsType::Fat32,   // FAT12/FAT16 也无硬链接
+        "FAT16" => FsType::Fat32, // 同上
+_ => FsType::Unknown,
     }
 }
