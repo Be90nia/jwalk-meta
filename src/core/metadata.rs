@@ -6,10 +6,12 @@
 //! In stdlib imported code, warnings are allowed.
 
 use std::fs::{self, Permissions};
+use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[inline]
@@ -58,6 +60,64 @@ pub struct MetaData {
     /// File permissions. `None` on Windows NT fast path (NT API doesn't return permissions),
     /// `Some` on all other paths. Always check with `is_some()` before use.
     pub permissions: Option<Permissions>,
+}
+
+/// 预计算的祖先 metadata identity，用于符号链接循环检测。
+///
+/// 在添加 ancestor 时一次性计算并存储，避免 follow_symlink 中
+/// 每次循环检测都需要 O(depth) 次 fs::metadata 系统调用。
+/// 循环检测降为 O(depth) 内存比较。
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct AncestorIdentity {
+    /// 祖先路径（用于错误消息）
+    pub path: Arc<Path>,
+    /// 设备 ID (st_dev)
+    pub dev: u64,
+    /// inode 号 (st_ino)
+    pub ino: u64,
+}
+
+#[cfg(unix)]
+impl AncestorIdentity {
+    /// 从路径的 symlink_metadata 计算身份标识。
+    ///
+    /// 如果获取 metadata 失败，返回 None（保守策略：跳过此 ancestor 的循环检测）。
+    pub fn from_path(path: Arc<Path>) -> Option<Self> {
+        let meta = fs::symlink_metadata(path.as_ref()).ok()?;
+        Some(AncestorIdentity {
+            path,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct AncestorIdentity {
+    /// 祖先路径（用于错误消息）
+    pub path: Arc<Path>,
+    /// 卷序列号
+    pub volume_serial_number: Option<u32>,
+    /// 文件索引
+    pub file_index: Option<u64>,
+}
+
+#[cfg(windows)]
+impl AncestorIdentity {
+    /// 从路径的 symlink_metadata 计算身份标识。
+    ///
+    /// 如果获取 metadata 失败，返回 None（保守策略：跳过此 ancestor 的循环检测）。
+    pub fn from_path(path: Arc<Path>) -> Option<Self> {
+        let meta = fs::symlink_metadata(path.as_ref()).ok()?;
+        let ext = get_metadata_ext(&meta);
+        Some(AncestorIdentity {
+            path,
+            volume_serial_number: ext.volume_serial_number,
+            file_index: ext.file_index,
+        })
+    }
 }
 
 /// Unix-specific file metadata, corresponding to POSIX `stat` fields.

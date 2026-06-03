@@ -123,7 +123,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{get_metadata_ext, ReadDir, ReadDirSpec, Weighted};
+use crate::core::{get_metadata_ext, ReadDir, ReadDirSpec, Weighted, AncestorIdentity};
 
 pub use crate::core::{DirEntry, DirEntryIter, Error, MetaData, MetaDataExt};
 pub use rayon;
@@ -395,14 +395,11 @@ fn process_dir_entry_result<C: ClientState>(
                 dir_entry = dir_entry.follow_symlink()?;
             }
 
-            if dir_entry.depth == 0 && dir_entry.file_type.is_symlink() {
-                // As a special case, if we are processing a root entry, then we
-                // always follow it even if it's a symlink and follow_links is
-                // false. We are careful to not let this change the semantics of
-                // the DirEntry however. Namely, the DirEntry should still
-                // respect the follow_links setting. When it's disabled, it
-                // should report itself as a symlink. When it's enabled, it
-                // should always report itself as the target.
+            // 当 follow_links=false 且根条目是符号链接时，
+            // from_path 使用 symlink_metadata（不 follow），file_type 是 symlink。
+            // 需要额外 stat 判断目标是否是目录以设置 read_children_path。
+            // 当 follow_links=true 时，follow_symlink 已处理，此处无需额外 stat。
+            if !follow_links && dir_entry.depth == 0 && dir_entry.file_type.is_symlink() {
                 let metadata = fs::metadata(dir_entry.path())
                     .map_err(|err| Error::from_path(0, dir_entry.path().to_owned(), err))?;
                 if metadata.file_type().is_dir() {
@@ -432,8 +429,10 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
         let dir_entry_capacity = self.options.dir_entry_capacity;
         let process_read_dir = self.options.process_read_dir.clone();
         let mut root_read_dir_state = self.options.root_read_dir_state;
-        let follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>> = if follow_links {
-            Some(Arc::new(vec![Arc::from(self.root.clone()) as Arc<Path>]))
+        let follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>> = if follow_links {
+            // 根条目的 identity 在 from_path 中已 stat，这里预计算
+            AncestorIdentity::from_path(Arc::from(self.root.clone()) as Arc<Path>)
+                .map(|id| Arc::new(vec![id]))
         } else {
             None
         };
@@ -488,7 +487,10 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                         .unwrap_or(&[]);
                     let mut ancestors = Vec::with_capacity(existing.len() + 1);
                     ancestors.extend(existing.iter().cloned());
-                    ancestors.push(path.clone());
+                    // 预计算当前目录的 identity（1 次 stat），避免 follow_symlink 中 O(D) 次 stat
+                    if let Some(identity) = AncestorIdentity::from_path(path.clone()) {
+                        ancestors.push(identity);
+                    }
                     Some(Arc::new(ancestors))
                 } else {
                     follow_link_ancestors
@@ -703,22 +705,30 @@ mod read_dir_windows_helpers {
         win32_fallback_path: Option<&Path>,
     ) -> MetaDataExt {
         // 优先使用 NT API 批量查询的预计算值
-        let number_of_links = info.number_of_links.or_else(|| {
-            win32_fallback_path.and_then(|path| {
-                std::fs::symlink_metadata(path).ok().and_then(|m| {
-                    crate::core::get_metadata_ext(&m).number_of_links
-                })
-            })
-        });
-        let volume_serial_number = info.volume_serial_number.or_else(|| {
-            win32_fallback_path.and_then(|path| {
-                std::fs::symlink_metadata(path).ok().and_then(|m| {
-                    crate::core::get_metadata_ext(&m).volume_serial_number
-                })
-            })
-        });
+        // P4: 当任一预计算值缺失时，只调用1次 symlink_metadata（之前调用2次）
+        let (number_of_links, volume_serial_number) = {
+            let need_nlink = info.number_of_links.is_none();
+            let need_vol = info.volume_serial_number.is_none();
+            if need_nlink || need_vol {
+                if let Some(path) = win32_fallback_path {
+                    if let Ok(m) = std::fs::symlink_metadata(path) {
+                        let ext = crate::core::get_metadata_ext(&m);
+                        (
+                            info.number_of_links.or(ext.number_of_links),
+                            info.volume_serial_number.or(ext.volume_serial_number),
+                        )
+                    } else {
+                        (info.number_of_links, info.volume_serial_number)
+                    }
+                } else {
+                    (info.number_of_links, info.volume_serial_number)
+                }
+            } else {
+                (info.number_of_links, info.volume_serial_number)
+            }
+        };
 
-        MetaDataExt {
+MetaDataExt {
             file_attributes: info.file_attributes,
             volume_serial_number,
             number_of_links,
@@ -733,7 +743,7 @@ mod read_dir_windows_helpers {
         parent_path: Arc<Path>,
         read_metadata: bool,
         read_metadata_ext: bool,
-        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     ) -> Result<DirEntry<C>> {
         let entry_metadata = if read_metadata {
             Some(make_metadata(info))
@@ -783,7 +793,7 @@ fn read_dir_windows<C: ClientState>(
     dir_entry_capacity: usize,
     skip_hidden: bool,
     sort: bool,
-    follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     mut client_read_state: C::ReadDirState,
     process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
     streaming_ctx: Option<crate::core::StreamingContext<C>>,
@@ -946,7 +956,7 @@ fn read_dir_unix<C: ClientState>(
     read_metadata_ext: bool,
     skip_hidden: bool,
     sort: bool,
-    follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     mut client_read_state: C::ReadDirState,
     process_read_dir: Option<&Arc<ProcessReadDirFunction<C>>>,
 ) -> Result<ReadDir<C>> {
@@ -990,7 +1000,8 @@ fn read_dir_unix<C: ClientState>(
                     });
                 }
             } else if read_metadata_ext {
-                if let Ok(metadata) = fs::metadata(fs_dir_entry.path()) {
+                // P3: 使用 symlink_metadata 避免 follow symlink 的额外路径解析开销
+                if let Ok(metadata) = fs::symlink_metadata(fs_dir_entry.path()) {
                     entry_metadata_ext = Some(get_metadata_ext(&metadata));
                 }
             }

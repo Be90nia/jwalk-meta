@@ -4,7 +4,7 @@ use std::fs::{self, FileType};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::{ClientState, Error, ReadDirSpec, Result, MetaData, get_metadata_ext, MetaDataExt};
+use crate::{ClientState, Error, ReadDirSpec, Result, MetaData, get_metadata_ext, MetaDataExt, AncestorIdentity};
 
 /// Representation of a file or directory.
 ///
@@ -43,11 +43,10 @@ pub struct DirEntry<C: ClientState> {
     pub metadata_ext: Option<MetaDataExt>,
     // True if [`follow_links`] is `true` AND was created from a symlink path.
     follow_link: bool,
-    // 符号链接祖先路径列表，用 Arc 共享避免 O(depth) 克隆。
-    // 循环检测通过 metadata identity (dev+ino / vol+file_index) 实现，
-    // 每次检测需 O(depth) 次 fs::metadata 系统调用。
-    // 未来优化方向：缓存 ancestor 的 metadata identity 避免重复 stat。
-    follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+    // 符号链接祖先的 metadata identity 列表，用 Arc 共享避免 O(depth) 克隆。
+    // 循环检测通过预存的 identity (dev+ino / vol+file_index) 直接内存比较，
+    // 无需 O(depth) 次 fs::metadata 系统调用。
+    follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     // Lazily cached full path (parent_path + file_name).
     cached_path: OnceLock<PathBuf>,
 }
@@ -64,7 +63,7 @@ impl<C: ClientState> DirEntry<C> {
         metadata_ext: Option<MetaDataExt>,
         file_name: OsString,
         file_type: FileType,
-        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+        follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     ) -> Result<Self> {
         let read_children_path: Option<Arc<Path>> = if file_type.is_dir() {
             Some(Arc::from(parent_path.join(&file_name)))
@@ -91,13 +90,13 @@ impl<C: ClientState> DirEntry<C> {
     }
 
     // Only used for root and when following links.
-    pub fn from_path(
+pub fn from_path(
         depth: usize,
         path: &Path,
         read_metadata: bool,
         read_metadata_ext: bool,
         follow_link: bool,
-        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+        follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     ) -> Result<Self> {
         let metadata = if follow_link {
             fs::metadata(path).map_err(|err| Error::from_path(depth, path.to_owned(), err))?
@@ -162,8 +161,8 @@ impl<C: ClientState> DirEntry<C> {
         parent_path: Arc<Path>,
         metadata: Option<MetaData>,
         metadata_ext: Option<MetaDataExt>,
-        entry: &fs::DirEntry,
-        follow_link_ancestors: Option<Arc<Vec<Arc<Path>>>>,
+entry: &fs::DirEntry,
+        follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     ) -> Result<Self> {
         let file_type = entry.file_type().map_err(|err| Error::from_io(depth, err))?;
         let read_children_path: Option<Arc<Path>> = if file_type.is_dir() {
@@ -322,20 +321,15 @@ impl<C: ClientState> DirEntry<C> {
             if let Ok(target_meta) = fs::metadata(&canonical_target) {
                 let target_ext = get_metadata_ext(&target_meta);
 
-                // TODO(jwalk-meta-wwy): 当前每次循环检测需 O(depth) 次 stat 系统调用。
-                // 可预计算 ancestor 的 MetaDataExt 并存入 ancestors 列表，
-                // 将循环检测从 O(depth) syscalls 降为 O(depth) 内存比较。
+                // 预存的 ancestor identity 直接内存比较，无需 O(depth) 次 stat。
                 if let Some(ancestors) = &self.follow_link_ancestors {
                     for ancestor in ancestors.iter().rev() {
-                        if let Ok(ancestor_meta) = fs::metadata(ancestor.as_ref()) {
-                            let ancestor_ext = get_metadata_ext(&ancestor_meta);
-                            if Self::metadata_identity_eq(&target_ext, &ancestor_ext) {
-                                return Err(Error::from_loop(
-                                    self.depth,
-                                    ancestor.as_ref(),
-                                    path,
-                                ));
-                            }
+                        if Self::ancestor_identity_eq(&target_ext, ancestor) {
+                            return Err(Error::from_loop(
+                                self.depth,
+                                &ancestor.path,
+                                path,
+                            ));
                         }
                     }
                 }
@@ -345,20 +339,21 @@ impl<C: ClientState> DirEntry<C> {
         Ok(dir_entry)
     }
 
-    /// 比较 metadata identity 判断是否为同一文件系统对象。
+    /// 比较 target MetaDataExt 与预存的 ancestor identity 是否为同一文件系统对象。
     ///
-    /// Unix 使用 (dev, ino)，Windows 使用 (volume_serial_number, file_index)。
-    /// 如果任一字段不可用则返回 false（保守策略：宁可漏检也不误报）。
-    fn metadata_identity_eq(a: &MetaDataExt, b: &MetaDataExt) -> bool {
+    /// Unix: 比较 (dev, ino)
+    /// Windows: 比较 (volume_serial_number, file_index)
+    /// 如果 ancestor identity 字段不完整则返回 false（保守策略：宁可漏检也不误报）。
+    fn ancestor_identity_eq(target: &MetaDataExt, ancestor: &AncestorIdentity) -> bool {
         #[cfg(unix)]
         {
-            a.st_dev == b.st_dev && a.st_ino == b.st_ino
+            target.st_dev == ancestor.dev && target.st_ino == ancestor.ino
         }
         #[cfg(windows)]
         {
-            match (a.volume_serial_number, a.file_index, b.volume_serial_number, b.file_index) {
-                (Some(vol_a), Some(idx_a), Some(vol_b), Some(idx_b)) => {
-                    vol_a == vol_b && idx_a == idx_b
+            match (target.volume_serial_number, target.file_index, ancestor.volume_serial_number, ancestor.file_index) {
+                (Some(vol_t), Some(idx_t), Some(vol_a), Some(idx_a)) => {
+                    vol_t == vol_a && idx_t == idx_a
                 }
                 _ => false,
             }

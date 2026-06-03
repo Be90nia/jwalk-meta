@@ -30,7 +30,7 @@ pub use dir_entry_iter::DirEntryIter;
 pub use error::Error;
 pub use read_dir::ReadDir;
 pub use read_dir_spec::ReadDirSpec;
-pub use metadata::{get_metadata_ext, MetaData, MetaDataExt};
+pub use metadata::{get_metadata_ext, MetaData, MetaDataExt, AncestorIdentity};
 pub(crate) use weighted::Weighted;
 pub(crate) use read_dir_iter::StreamingContext;
 
