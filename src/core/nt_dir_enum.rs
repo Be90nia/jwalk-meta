@@ -5,7 +5,6 @@
 
 #![cfg(windows)]
 
-use rayon::prelude::*;
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
@@ -523,79 +522,72 @@ pub fn batch_query_nlinks(
         None => return, // NtQueryInformationByName 不可用（老 Windows），保持 None
     };
 
-    // 将 HANDLE(*mut c_void) 转为 isize 以满足 Send + Sync 约束。
-    // HANDLE 是内核对象引用（整数索引），不是真正的指针，跨线程传递安全。
-    // 生命周期由 HandleGuard 保证——Drop 在所有 rayon 工作完成后才执行。
+    // 单线程遍历：NTFS 内核对同卷 MFT 查询有卷级互斥锁，
+    // 多线程并发查同一卷没有加速效果，反而有线程调度开销。
+    // 参见：batch_query_nlinks 性能分析（rayon par_iter_mut 8线程 5.1s > 单线程 3.5s）
     let root_handle_raw = dir_handle.handle() as isize;
-
-    // rayon 并行遍历：每个条目独立查询，线程间无共享可变状态
-    entries.par_iter_mut().for_each(move |entry| {
+    entries.iter_mut().for_each(|entry| {
         // 条件过滤：仅目录条目需要查询 NumberOfLinks（除非 query_file_nlinks=true）
-        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         if !query_file_nlinks && (entry.file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 {
             return; // 非目录条目，跳过查询
         }
 
-        // 使用 TLS 缓冲区复用 Vec<u16>，避免每次迭代堆分配
-        // encode_wide → clear + extend 复用已分配容量
-        TLS_WIDE_BUF.with(|buf| {
-            let mut wide_buf = buf.borrow_mut();
-            wide_buf.clear();
-            wide_buf.extend(entry.file_name.encode_wide());
-            if wide_buf.is_empty() {
-                return;
-            }
+        // 单线程无需 TLS，直接使用局部缓冲区
+        let mut wide_buf = Vec::with_capacity(260);
+        wide_buf.extend(entry.file_name.encode_wide());
+        if wide_buf.is_empty() {
+            return;
+        }
 
-            // 每个线程独立的 FILE_STAT_INFORMATION 缓冲区（栈上 72 字节）
-            let mut stat_info_buf = [0u8; std::mem::size_of::<FILE_STAT_INFORMATION>()];
+        // 每次迭代独立的 FILE_STAT_INFORMATION 缓冲区（栈上 72 字节）
+        let mut stat_info_buf = [0u8; std::mem::size_of::<FILE_STAT_INFORMATION>()];
 
-            let byte_len = (wide_buf.len() * 2) as u16;
-            let mut unicode_str = UNICODE_STRING {
-                Length: byte_len,
-                MaximumLength: byte_len,
-                Buffer: wide_buf.as_ptr() as *mut u16,
+        let byte_len = (wide_buf.len() * 2) as u16;
+        let mut unicode_str = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: wide_buf.as_ptr() as *mut u16,
+        };
+
+        let mut obj_attrs = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: root_handle_raw as HANDLE,
+            ObjectName: &mut unicode_str,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+
+        let mut iosb = IO_STATUS_BLOCK {
+            Status: 0,
+            Information: 0,
+        };
+
+        // SAFETY:
+        // 1. obj_attrs 由 root_handle + 相对文件名构成，NtQueryInformationByName
+        //    使用 RootDirectory + ObjectName 定位文件，无需打开文件句柄
+        // 2. stat_info_buf 大小 = size_of::<FILE_STAT_INFORMATION>() = 72 字节
+        // 3. FILE_STAT_INFORMATION_CLASS = 68 是合法的信息类（Win10 1709+）
+        // 4. unicode_str.Buffer 指向 wide_buf，在本函数作用域内有效
+        // 5. root_handle 是内核句柄，单线程读操作安全
+        let status = unsafe {
+            query_by_name(
+                &mut obj_attrs,
+                &mut iosb,
+                stat_info_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                stat_info_buf.len() as u32,
+                FILE_STAT_INFORMATION_CLASS,
+            )
+        };
+
+        if status == 0 {
+            // SAFETY: NtQueryInformationByName 成功时，缓冲区包含有效的 FILE_STAT_INFORMATION
+            let stat_info = unsafe {
+                std::ptr::read_unaligned(stat_info_buf.as_ptr() as *const FILE_STAT_INFORMATION)
             };
-
-            let mut obj_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: root_handle_raw as HANDLE,
-                ObjectName: &mut unicode_str,
-                Attributes: OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: ptr::null_mut(),
-                SecurityQualityOfService: ptr::null_mut(),
-            };
-
-            let mut iosb = IO_STATUS_BLOCK {
-                Status: 0,
-                Information: 0,
-            };
-
-            // SAFETY:
-            // 1. obj_attrs 由 root_handle + 相对文件名构成，NtQueryInformationByName
-            //    使用 RootDirectory + ObjectName 定位文件，无需打开文件句柄
-            // 2. stat_info_buf 大小 = size_of::<FILE_STAT_INFORMATION>() = 72 字节
-            // 3. FILE_STAT_INFORMATION_CLASS = 68 是合法的信息类（Win10 1709+）
-            // 4. unicode_str.Buffer 指向 wide_buf（TLS），在 TLS with 块内有效
-            // 5. root_handle 是内核句柄，多线程并发读操作安全
-            let status = unsafe {
-                query_by_name(
-                    &mut obj_attrs,
-                    &mut iosb,
-                    stat_info_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    stat_info_buf.len() as u32,
-                    FILE_STAT_INFORMATION_CLASS,
-                )
-            };
-
-            if status == 0 {
-                // SAFETY: NtQueryInformationByName 成功时，缓冲区包含有效的 FILE_STAT_INFORMATION
-                let stat_info = unsafe {
-                    std::ptr::read_unaligned(stat_info_buf.as_ptr() as *const FILE_STAT_INFORMATION)
-                };
-                entry.number_of_links = Some(stat_info.NumberOfLinks);
-            }
-            // 查询失败时保持 number_of_links = None
-        });
+            entry.number_of_links = Some(stat_info.NumberOfLinks);
+        }
+        // 查询失败时保持 number_of_links = None
     });
 }
 
