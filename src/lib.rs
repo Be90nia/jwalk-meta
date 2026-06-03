@@ -922,7 +922,7 @@ fn read_dir_windows<C: ClientState>(
                 entry.number_of_links = Some(1);
             }
         } else {
-            batch_query_nlinks(&mut entries, &guard, false); // 仅查询目录的 nlink，文件保持 None
+            batch_query_nlinks(&mut entries, &guard, read_hardlink_info); // read_hardlink_info=true 时也查询文件 nlink
         }
         if let Some(vs) = vol_serial {
             for entry in entries.iter_mut() {
