@@ -33,6 +33,7 @@ pub use read_dir_spec::ReadDirSpec;
 pub use metadata::{get_metadata_ext, MetaData, MetaDataExt, AncestorIdentity};
 pub(crate) use weighted::Weighted;
 pub(crate) use read_dir_iter::StreamingContext;
+pub(crate) use error::is_transient_error;
 
 #[cfg(windows)]
 pub(crate) use nt_dir_enum::{

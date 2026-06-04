@@ -122,6 +122,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use core::is_transient_error;
 
 use crate::core::{get_metadata_ext, ReadDir, ReadDirSpec, Weighted, AncestorIdentity};
 
@@ -216,6 +217,8 @@ struct WalkDirOptions<C: ClientState> {
     parallelism: Parallelism,
     root_read_dir_state: C::ReadDirState,
     process_read_dir: Option<Arc<ProcessReadDirFunction<C>>>,
+    /// I/O 操作的临时错误最大重试次数。默认 3，设为 0 则不重试。
+    max_retries: u8,
 }
 
 impl<C: ClientState> WalkDirGeneric<C> {
@@ -245,6 +248,7 @@ impl<C: ClientState> WalkDirGeneric<C> {
                 },
                 root_read_dir_state: C::ReadDirState::default(),
                 process_read_dir: None,
+                max_retries: 3,
             },
         }
     }
@@ -400,6 +404,22 @@ impl<C: ClientState> WalkDirGeneric<C> {
         self.options.process_read_dir = Some(Arc::new(process_by));
         self
     }
+
+    /// 设置 I/O 操作遇到临时错误时的最大重试次数。
+    ///
+    /// 默认值为 3。设为 0 则不重试（保持旧行为）。
+    ///
+    /// 可重试的临时错误包括（不限于）：
+    /// - **Windows**: `ERROR_SHARING_VIOLATION`(32)、`ERROR_LOCK_VIOLATION`(33)、
+    ///   `ERROR_NETWORK_BUSY`(54)、`ERROR_SEM_TIMEOUT`(121)、`ERROR_RETRY`(1237)
+    /// - **Unix**: `EAGAIN`(11)、`EBUSY`(16)、`ESTALE`(150)
+    /// - **通用**: `TimedOut`、`Interrupted`、`WouldBlock`、`ConnectionReset`、`ConnectionAborted`
+    ///
+    /// 重试时使用 `yield_now()` 让出 CPU，不阻塞工作线程。
+    pub fn max_retries(mut self, n: u8) -> Self {
+        self.options.max_retries = n;
+        self
+    }
 }
 
 fn process_dir_entry_result<C: ClientState>(
@@ -445,6 +465,7 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
         let read_metadata_ext = self.options.read_metadata_ext;
         let read_hardlink_info = self.options.read_hardlink_info;
         let dir_entry_capacity = self.options.dir_entry_capacity;
+        let max_retries = self.options.max_retries;
         let process_read_dir = self.options.process_read_dir.clone();
         let mut root_read_dir_state = self.options.root_read_dir_state;
         let follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>> = if follow_links {
@@ -516,41 +537,74 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
 
                 #[cfg(windows)]
                 {
-                    read_dir_windows(
-                        path,
-                        read_dir_depth,
-                        read_dir_contents_depth,
-                        follow_links,
-                        read_metadata,
-                        read_metadata_ext,
-                        read_hardlink_info,
-                        dir_entry_capacity,
-                        skip_hidden,
-                        sort,
-                        follow_link_ancestors,
-                        client_read_state,
-                        process_read_dir.as_ref(),
-                        streaming_ctx,
-                    )
+                    let mut streaming_ctx = streaming_ctx;
+                    let mut last_err = None;
+                    for attempt in 0..=max_retries {
+                        match read_dir_windows(
+                            path.clone(),
+                            read_dir_depth,
+                            read_dir_contents_depth,
+                            follow_links,
+                            read_metadata,
+                            read_metadata_ext,
+                            read_hardlink_info,
+                            dir_entry_capacity,
+                            skip_hidden,
+                            sort,
+                            follow_link_ancestors.clone(),
+                            client_read_state.clone(),
+                            process_read_dir.as_ref(),
+                            streaming_ctx.take(),
+                        ) {
+                            Ok(result) => return Ok(result),
+                            Err(e) => {
+                                if attempt < max_retries && is_transient_error(&e) {
+                                    if attempt > 0 {
+                                        std::thread::yield_now();
+                                    }
+                                    last_err = Some(e);
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Err(last_err.unwrap())
                 }
 
                 #[cfg(not(windows))]
                 {
-                    let _ = streaming_ctx; // 消除 unused 警告
-                    read_dir_unix(
-                        path,
-                        read_dir_depth,
-                        read_dir_contents_depth,
-                        follow_links,
-                        read_metadata,
-                        read_metadata_ext,
-                        read_hardlink_info,
-                        skip_hidden,
-                        sort,
-                        follow_link_ancestors,
-                        client_read_state,
-                        process_read_dir.as_ref(),
-                    )
+                    let _ = streaming_ctx;
+                    let mut last_err = None;
+                    for attempt in 0..=max_retries {
+                        match read_dir_unix(
+                            path.clone(),
+                            read_dir_depth,
+                            read_dir_contents_depth,
+                            follow_links,
+                            read_metadata,
+                            read_metadata_ext,
+                            read_hardlink_info,
+                            skip_hidden,
+                            sort,
+                            follow_link_ancestors.clone(),
+                            client_read_state.clone(),
+                            process_read_dir.as_ref(),
+                        ) {
+                            Ok(result) => return Ok(result),
+                            Err(e) => {
+                                if attempt < max_retries && is_transient_error(&e) {
+                                    if attempt > 0 {
+                                        std::thread::yield_now();
+                                    }
+                                    last_err = Some(e);
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Err(last_err.unwrap())
                 }
             }),
         )
@@ -572,6 +626,7 @@ impl<C: ClientState> Clone for WalkDirOptions<C> {
             parallelism: self.parallelism.clone(),
             root_read_dir_state: self.root_read_dir_state.clone(),
             process_read_dir: self.process_read_dir.clone(),
+            max_retries: self.max_retries,
         }
     }
 }
