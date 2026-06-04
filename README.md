@@ -34,7 +34,7 @@
 
 ```toml
 [dependencies]
-jwalk-meta = "0.9"
+jwalk-meta = "1.0"
 ```
 
 需要 Rust nightly 工具链。

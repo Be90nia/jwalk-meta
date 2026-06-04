@@ -49,14 +49,14 @@
 //!             (Err(_), Ok(_)) => Ordering::Greater,
 //!             (Err(_), Err(_)) => Ordering::Equal,
 //!         });
-//!         // 2. Custom filter
+//!         // 2. Custom filter (keep Err entries to propagate I/O errors)
 //!         children.retain(|dir_entry_result| {
 //!             dir_entry_result.as_ref().map(|dir_entry| {
 //!                 dir_entry.file_name
 //!                     .to_str()
 //!                     .map(|s| s.starts_with('.'))
 //!                     .unwrap_or(false)
-//!             }).unwrap_or(false)
+//!             }).unwrap_or(true)
 //!         });
 //!         // 3. Custom skip
 //!         children.iter_mut().for_each(|dir_entry_result| {
@@ -1034,6 +1034,14 @@ fn read_dir_unix<C: ClientState>(
                         accessed: None,
                         permissions: None,
                     });
+                } else {
+                    // metadata() and file_type() both failed — propagate error
+                    let path = fs_dir_entry.path();
+                    return Some(Err(Error::from_path(
+                        read_dir_contents_depth,
+                        path,
+                        std::io::Error::new(std::io::ErrorKind::Other, "failed to read metadata"),
+                    )));
                 }
             } else if read_metadata_ext {
                 // P3: 使用 symlink_metadata 避免 follow symlink 的额外路径解析开销
