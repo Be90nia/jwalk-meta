@@ -40,6 +40,7 @@ where
     receive_buffer: BinaryHeap<Ordered<T>>,
     pending_count: Arc<AtomicUsize>,
     ordered_matcher: OrderedMatcher,
+    max_receive_buffer_size: usize,
 }
 
 struct OrderedMatcher {
@@ -47,22 +48,17 @@ struct OrderedMatcher {
     child_count_stack: Vec<usize>,
 }
 
-/// Bounded channel 容量：提供充足的缓冲避免生产者阻塞。
-/// 设为 524288 (512K)，百万级条目扫描下也不会成为瓶颈。
-/// 每个条目仅持有指针/小结构，524288 × ~64B ≈ 32MB，内存开销可控。
-const CHANNEL_CAPACITY: usize = 524288;
-
-const MAX_RECEIVE_BUFFER_SIZE: usize = 4096;
-
 pub(crate) fn new_ordered_queue<T>(
     stop: Arc<AtomicBool>,
     ordering: Ordering,
+    channel_capacity: usize,
+    max_receive_buffer_size: usize,
 ) -> (OrderedQueue<T>, OrderedQueueIter<T>)
 where
     T: Send,
 {
     let pending_count = Arc::new(AtomicUsize::new(0));
-    let (sender, receiver) = channel::bounded(CHANNEL_CAPACITY);
+    let (sender, receiver) = channel::bounded(channel_capacity);
     (
         OrderedQueue {
             sender,
@@ -76,6 +72,7 @@ where
             receive_buffer: BinaryHeap::with_capacity(INITIAL_HEAP_CAPACITY),
             pending_count,
             stop,
+            max_receive_buffer_size,
         },
     )
 }
@@ -125,7 +122,7 @@ where
 
     /// 批量 drain channel 中所有就绪元素到 receive_buffer。
     fn drain_channel(&mut self) {
-        while self.receive_buffer.len() < MAX_RECEIVE_BUFFER_SIZE {
+        while self.receive_buffer.len() < self.max_receive_buffer_size {
             if let Ok(ordered) = self.receiver.try_recv() {
                 self.receive_buffer.push(ordered);
             } else {

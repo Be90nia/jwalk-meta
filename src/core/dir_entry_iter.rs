@@ -34,6 +34,8 @@ impl<C: ClientState> DirEntryIter<C> {
         min_depth: usize,
         root_read_dir_state: C::ReadDirState,
         core_read_dir_callback: Arc<ReadDirCallback<C>>,
+        channel_capacity: usize,
+        max_receive_buffer_size: usize,
     ) -> DirEntryIter<C> {
         // 1. Gather read_dir_specs from root level
         let read_dir_specs: Vec<_> = root_entry_results
@@ -48,7 +50,7 @@ impl<C: ClientState> DirEntryIter<C> {
 
         // 2. Init new read_dir_iter from those specs
         let (read_dir_iter, stop) =
-            match ReadDirIter::try_new(read_dir_specs, parallelism, core_read_dir_callback) {
+            match ReadDirIter::try_new(read_dir_specs, parallelism, core_read_dir_callback, channel_capacity, max_receive_buffer_size) {
                 Some((iter, stop)) => (Some(iter.peekable()), stop),
                 None => (None, None),
             };

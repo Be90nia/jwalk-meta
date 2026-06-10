@@ -25,23 +25,19 @@ where
     pending_count: Arc<AtomicUsize>,
 }
 
-/// Bounded channel 容量：提供充足的缓冲避免生产者阻塞。
-/// 设为 524288 (512K)，百万级条目扫描下也不会成为瓶颈。
-/// 每个条目仅持有指针/小结构，524288 × ~64B ≈ 32MB，内存开销可控。
-const CHANNEL_CAPACITY: usize = 524288;
-
 /// BinaryHeap 初始容量：256 是经验值，平衡初始内存占用和重新分配次数。
 /// 普通目录子项数通常 < 256，避免首次扩展。
 const INITIAL_HEAP_CAPACITY: usize = 256;
 
 pub(crate) fn new_priority_queue<T>(
     stop: Arc<AtomicBool>,
+    channel_capacity: usize,
 ) -> (PriorityQueue<T>, PriorityQueueIter<T>)
 where
     T: Send,
 {
     let pending_count = Arc::new(AtomicUsize::new(0));
-    let (sender, receiver) = channel::bounded(CHANNEL_CAPACITY);
+    let (sender, receiver) = channel::bounded(channel_capacity);
     (
         PriorityQueue {
             sender,

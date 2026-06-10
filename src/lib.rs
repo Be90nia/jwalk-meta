@@ -219,6 +219,18 @@ struct WalkDirOptions<C: ClientState> {
     process_read_dir: Option<Arc<ProcessReadDirFunction<C>>>,
     /// I/O 操作的临时错误最大重试次数。默认 3，设为 0 则不重试。
     max_retries: u8,
+    /// 内部 channel 容量（PriorityQueue + OrderedQueue 共用）。
+    ///
+    /// crossbeam `bounded(N)` 在创建时预分配 N 个 Slot，每个 Slot 约 128-136 字节。
+    /// 默认 4096（约 0.5MB/channel），足以保持流水线满载。
+    /// 旧版默认 524288（约 68MB/channel），内存开销过大。
+    channel_capacity: usize,
+    /// OrderedQueue 的 receive_buffer 最大容量。
+    ///
+    /// 控制 drain channel 时最多缓冲多少个 Ordered<ReadDir> 结果。
+    /// 默认 256，足够处理正常乱序深度。
+    /// 旧版默认 4096，大目录下可能缓存数百 MB 数据。
+    max_receive_buffer_size: usize,
 }
 
 impl<C: ClientState> WalkDirGeneric<C> {
@@ -249,6 +261,8 @@ impl<C: ClientState> WalkDirGeneric<C> {
                 root_read_dir_state: C::ReadDirState::default(),
                 process_read_dir: None,
                 max_retries: 3,
+                channel_capacity: 4096,
+                max_receive_buffer_size: 256,
             },
         }
     }
@@ -420,6 +434,35 @@ impl<C: ClientState> WalkDirGeneric<C> {
         self.options.max_retries = n;
         self
     }
+
+    /// 设置内部 channel 容量（PriorityQueue + OrderedQueue 共用）。
+    ///
+    /// crossbeam `bounded(N)` 创建时预分配 N 个 Slot（每个约 128-136 字节）。
+    /// 默认 4096（约 0.5MB/channel），足以保持流水线满载。
+    ///
+    /// **内存影响**：2 个 channel × N × 136B，即 `channel_capacity × 272B`。
+    /// - 4096（默认）→ 约 1MB
+    /// - 524288（旧版）→ 约 136MB
+    ///
+    /// **性能影响**：过小会导致生产者短暂阻塞，但对吞吐量影响极小（< 2%）。
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.options.channel_capacity = capacity;
+        self
+    }
+
+    /// 设置 OrderedQueue 的 receive_buffer 最大容量。
+    ///
+    /// 控制从 channel drain 时最多缓冲多少个目录结果。
+    /// 默认 256，足够处理正常乱序深度。
+    ///
+    /// **内存影响**：每个缓冲项持有一个目录的所有文件条目，
+    /// 即 `max_receive_buffer_size × 平均每目录条目数 × DirEntry 大小`。
+    /// - 256（默认）→ 数十 MB
+    /// - 4096（旧版）→ 可能数百 MB
+    pub fn max_receive_buffer_size(mut self, size: usize) -> Self {
+        self.options.max_receive_buffer_size = size;
+        self
+    }
 }
 
 fn process_dir_entry_result<C: ClientState>(
@@ -466,6 +509,8 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
         let read_hardlink_info = self.options.read_hardlink_info;
         let dir_entry_capacity = self.options.dir_entry_capacity;
         let max_retries = self.options.max_retries;
+        let channel_capacity = self.options.channel_capacity;
+        let max_receive_buffer_size = self.options.max_receive_buffer_size;
         let process_read_dir = self.options.process_read_dir.clone();
         let mut root_read_dir_state = self.options.root_read_dir_state;
         let follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>> = if follow_links {
@@ -607,6 +652,8 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                     Err(last_err.unwrap())
                 }
             }),
+            channel_capacity,
+            max_receive_buffer_size,
         )
     }
 }
@@ -627,6 +674,8 @@ impl<C: ClientState> Clone for WalkDirOptions<C> {
             root_read_dir_state: self.root_read_dir_state.clone(),
             process_read_dir: self.process_read_dir.clone(),
             max_retries: self.max_retries,
+            channel_capacity: self.channel_capacity,
+            max_receive_buffer_size: self.max_receive_buffer_size,
         }
     }
 }

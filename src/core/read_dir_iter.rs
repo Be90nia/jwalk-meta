@@ -66,6 +66,8 @@ impl<C: ClientState> ReadDirIter<C> {
         read_dir_specs: Vec<ReadDirSpec<C>>,
         parallelism: Parallelism,
         core_read_dir_callback: Arc<ReadDirCallback<C>>,
+        channel_capacity: usize,
+        max_receive_buffer_size: usize,
     ) -> Option<(Self, Option<Arc<AtomicBool>>)> {
         if let Parallelism::Serial = parallelism {
             Some((
@@ -77,10 +79,15 @@ impl<C: ClientState> ReadDirIter<C> {
             ))
         } else {
             let stop = Arc::new(AtomicBool::new(false));
-            let read_dir_result_queue = new_ordered_queue(stop.clone(), Ordering::Strict);
+            let read_dir_result_queue = new_ordered_queue(
+                stop.clone(),
+                Ordering::Strict,
+                channel_capacity,
+                max_receive_buffer_size,
+            );
             let (read_dir_result_queue, read_dir_result_iter) = read_dir_result_queue;
             let (read_dir_spec_queue, read_dir_spec_iter) =
-                new_priority_queue(stop.clone());
+                new_priority_queue(stop.clone(), channel_capacity);
 
             // 根目录使用高位权重，确保最先被调度（优先淹没算法）
             // 使用 (usize::MAX >> 1) 避免 parent_weight + child_count 溢出
