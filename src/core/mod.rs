@@ -40,6 +40,5 @@ pub(crate) use nt_dir_enum::{
     enumerate_dir, enumerate_dir_streaming, DirEntryInfo, batch_query_nlinks,
     detect_fs_type_and_vol_serial,
 };
-pub use ordered_queue::Ordering;
 
 use crate::{ClientState, Parallelism};

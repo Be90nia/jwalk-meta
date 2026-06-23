@@ -116,16 +116,7 @@ pub fn from_path(
         let entry_metadata;
         let entry_metadata_ext;
         if read_metadata {
-            entry_metadata = Some(MetaData {
-                is_dir: metadata.is_dir(),
-                is_file: metadata.is_file(),
-                is_symlink: metadata.is_symlink(),
-                size: metadata.len(),
-                created: metadata.created().ok(),
-                modified: metadata.modified().ok(),
-                accessed: metadata.accessed().ok(),
-                permissions: Some(metadata.permissions()),
-            });
+            entry_metadata = Some(MetaData::from_fs_metadata(&metadata));
             if read_metadata_ext {
                 entry_metadata_ext = Some(get_metadata_ext(&metadata));
             } else {

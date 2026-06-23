@@ -30,9 +30,6 @@ const BUFFER_SIZE: usize = 64 * 1024;
 // 线程本地缓冲区，在 rayon worker 线程间复用 64KB 堆分配。
 thread_local! {
     static TLS_BUFFER: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
-    /// UTF-16 编码缓冲区，batch_query_nlinks 中复用 Vec<u16> 避免每次迭代堆分配。
-    /// 文件名通常 <260 字符（MAX_PATH），初始容量 260 足够绝大多数场景。
-    static TLS_WIDE_BUF: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::with_capacity(260));
 }
 
 /// FILE_ID_BOTH_DIR_INFO 的文件信息类编号。
@@ -62,7 +59,7 @@ struct FILE_ID_BOTH_DIR_INFO {
     FileAttributes: u32,
     FileNameLength: u32,
     EaSize: u32,
-    ShortNameLength: i16,
+    ShortNameLength: i8,
     ShortName: [u16; 12],
     FileId: i64,
     FileName: [u16; 1],
@@ -165,11 +162,14 @@ struct NtDllFuncs {
     query_by_name: Option<NtQueryInformationByNameFn>,
 }
 
-/// 懒加载 ntdll 函数指针。失败时 panic（启动时一次性初始化）。
+/// 懒加载 ntdll 函数指针。失败时 panic（首次调用时初始化，通常在用户首次调用 into_iter() 时触发）。
 ///
-/// 设计决策：LoadLibraryW 增加了 ntdll.dll 的引用计数但未调用 FreeLibrary。
-/// 这是有意为之——ntdll.dll 是 Windows 进程级核心 DLL，永远不会被卸载，
-/// 函数指针需要在整个进程生命周期内保持有效。
+/// 设计决策：panic 是有意的 fail-fast——ntdll.dll 是 Windows 进程级核心 DLL，
+/// 加载失败意味着系统安装损坏或安全软件干预，进程无法继续正常运行。
+/// 改用 Result 传播只会把不可避免的崩溃推迟到调用方，无实际收益。
+///
+/// LoadLibraryW 增加了 ntdll.dll 的引用计数但未调用 FreeLibrary。
+/// 这是有意为之——ntdll.dll 永远不会被卸载，函数指针需要在整个进程生命周期内保持有效。
 fn ntdll_funcs() -> &'static NtDllFuncs {
     use std::sync::OnceLock;
     static FUNCS: OnceLock<NtDllFuncs> = OnceLock::new();
@@ -308,18 +308,28 @@ fn parse_buffer_entries(
     mut on_entry: impl FnMut(&FILE_ID_BOTH_DIR_INFO, OsString),
 ) {
     let mut offset: usize = 0;
+    let buf_len = buffer.len();
     loop {
-        // SAFETY: offset starts at 0 and advances by NextEntryOffset each iteration.
-        // The caller guarantees bytes_returned ensures offset < bytes_returned <= buffer.len().
+        // 边界检查：确保能读取完整的 entry 头部（含变长 FileName 的第一个元素）
+        // 内核返回的数据通常是可信的，此检查防御内存损坏或异常 NextEntryOffset
+        if offset + std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() > buf_len {
+            break;
+        }
+
+        // SAFETY: 边界检查已保证 offset..offset+size_of 在 buffer 内。
+        // FILE_ID_BOTH_DIR_INFO may appear at unaligned offsets (NT only guarantees
+        // 4-byte alignment, but the struct has u64 fields requiring 8-byte alignment).
         let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
-        // SAFETY: FILE_ID_BOTH_DIR_INFO fields are packed and the struct may appear at
-        // unaligned offsets within the buffer (NT only guarantees 4-byte alignment, but
-        // the struct contains u64 fields requiring 8-byte alignment). read_unaligned is
-        // required precisely because the data is NOT guaranteed to be naturally aligned.
         let entry = unsafe { std::ptr::read_unaligned(entry_ptr as *const FILE_ID_BOTH_DIR_INFO) };
 
         let name_len = entry.FileNameLength as usize;
         let name_chars = name_len / 2;
+
+        // 边界检查：确保 FileName 变长数据完全在 buffer 内
+        let name_start_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        if offset + name_start_offset + name_len > buf_len {
+            break;
+        }
 
         // Raw UTF-16 比较 "." 和 ".."，避免 to_string_lossy 堆分配
         // FileName 是 C 变长数组 ([u16; 1])，必须用指针访问避免编译器越界检查
@@ -331,10 +341,9 @@ fn parse_buffer_entries(
             && unsafe { *entry.FileName.as_ptr().add(1) } == b'.' as u16;
 
         if !is_dot && !is_dotdot {
-            // SAFETY: FileName 的字节数由 FileNameLength 保证，从 offset+offsetof(FileName) 开始。
+            // SAFETY: 边界检查已保证 FileName 的 name_len 字节在 buffer 内
             let name_slice = unsafe {
-                let name_start =
-                    entry_ptr.add(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName));
+                let name_start = entry_ptr.add(name_start_offset);
                 std::slice::from_raw_parts(name_start as *const u16, name_chars)
             };
             let file_name = OsString::from_wide(name_slice);
@@ -492,18 +501,21 @@ pub fn enumerate_dir_streaming(
 
 // ── Ext info 批量查询 ────────────────────────────────────────────────
 
-/// 使用 NtQueryInformationByName + FileStatInformation (class 68) 并行查询
+/// 使用 NtQueryInformationByName + FileStatInformation (class 68) 查询
 /// 目录条目的 NumberOfLinks。
 ///
 /// 利用已打开的目录句柄 + 相对文件名查询，无需逐文件打开句柄，
 /// 消除 symlink_metadata 的路径解析开销。
-/// 使用 rayon 并行遍历条目，充分利用多核 CPU 减少总耗时。
+///
+/// 单线程遍历：NTFS 内核对同卷 MFT 查询有卷级互斥锁，多线程并发查同一卷
+/// 没有加速效果，反而有线程调度开销（实测 rayon par_iter_mut 8 线程 5.1s >
+/// 单线程 iter_mut 3.5s）。
 ///
 /// 线程安全：
 /// - HANDLE 是内核对象引用，多线程并发读操作（NtQueryInformationByName）
 ///   是安全的——内核内部维护引用计数，CloseHandle 由 HandleGuard Drop 保证
 ///   在所有查询完成后才执行。
-/// - 每个线程独立构造 UNICODE_STRING + OBJECT_ATTRIBUTES + stat_info_buf，
+/// - 每次查询独立构造 UNICODE_STRING + OBJECT_ATTRIBUTES + stat_info_buf，
 ///   无共享可变状态，无竞锁风险。
 ///
 /// Win10 1709+ 可用。老版本 Windows 或查询失败时 number_of_links 保持 None。
@@ -526,14 +538,16 @@ pub fn batch_query_nlinks(
     // 多线程并发查同一卷没有加速效果，反而有线程调度开销。
     // 参见：batch_query_nlinks 性能分析（rayon par_iter_mut 8线程 5.1s > 单线程 3.5s）
     let root_handle_raw = dir_handle.handle() as isize;
+    // UTF-16 文件名缓冲区，跨条目复用避免 per-entry 堆分配。
+    // 260 容量覆盖 MAX_PATH，文件名超过时 Vec 自动扩容。
+    let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
     entries.iter_mut().for_each(|entry| {
         // 条件过滤：仅目录条目需要查询 NumberOfLinks（除非 query_file_nlinks=true）
         if !query_file_nlinks && (entry.file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 {
             return; // 非目录条目，跳过查询
         }
 
-        // 单线程无需 TLS，直接使用局部缓冲区
-        let mut wide_buf = Vec::with_capacity(260);
+        wide_buf.clear();
         wide_buf.extend(entry.file_name.encode_wide());
         if wide_buf.is_empty() {
             return;

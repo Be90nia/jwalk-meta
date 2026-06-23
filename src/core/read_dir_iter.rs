@@ -79,12 +79,8 @@ impl<C: ClientState> ReadDirIter<C> {
             ))
         } else {
             let stop = Arc::new(AtomicBool::new(false));
-            let read_dir_result_queue = new_ordered_queue(
-                stop.clone(),
-                Ordering::Strict,
-                channel_capacity,
-                max_receive_buffer_size,
-            );
+            let read_dir_result_queue =
+                new_ordered_queue(stop.clone(), channel_capacity, max_receive_buffer_size);
             let (read_dir_result_queue, read_dir_result_iter) = read_dir_result_queue;
             let (read_dir_spec_queue, read_dir_spec_iter) =
                 new_priority_queue(stop.clone(), channel_capacity);
@@ -212,7 +208,7 @@ fn multi_threaded_walk_dir<C: ClientState>(
 
     let ordered_read_dir_result = Ordered::new(
         read_dir_result,
-        index_path.clone(),
+        index_path,
         child_count,
     );
 

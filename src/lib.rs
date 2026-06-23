@@ -583,9 +583,8 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                 #[cfg(windows)]
                 {
                     let mut streaming_ctx = streaming_ctx;
-                    let mut last_err = None;
-                    for attempt in 0..=max_retries {
-                        match read_dir_windows(
+                    retry_transient_io(max_retries, || {
+                        read_dir_windows(
                             path.clone(),
                             read_dir_depth,
                             read_dir_contents_depth,
@@ -600,29 +599,15 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                             client_read_state.clone(),
                             process_read_dir.as_ref(),
                             streaming_ctx.take(),
-                        ) {
-                            Ok(result) => return Ok(result),
-                            Err(e) => {
-                                if attempt < max_retries && is_transient_error(&e) {
-                                    if attempt > 0 {
-                                        std::thread::yield_now();
-                                    }
-                                    last_err = Some(e);
-                                    continue;
-                                }
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Err(last_err.unwrap())
+                        )
+                    })
                 }
 
                 #[cfg(not(windows))]
                 {
                     let _ = streaming_ctx;
-                    let mut last_err = None;
-                    for attempt in 0..=max_retries {
-                        match read_dir_unix(
+                    retry_transient_io(max_retries, || {
+                        read_dir_unix(
                             path.clone(),
                             read_dir_depth,
                             read_dir_contents_depth,
@@ -635,21 +620,8 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
                             follow_link_ancestors.clone(),
                             client_read_state.clone(),
                             process_read_dir.as_ref(),
-                        ) {
-                            Ok(result) => return Ok(result),
-                            Err(e) => {
-                                if attempt < max_retries && is_transient_error(&e) {
-                                    if attempt > 0 {
-                                        std::thread::yield_now();
-                                    }
-                                    last_err = Some(e);
-                                    continue;
-                                }
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Err(last_err.unwrap())
+                        )
+                    })
                 }
             }),
             channel_capacity,
@@ -689,9 +661,8 @@ impl Parallelism {
             Parallelism::Serial => op(),
             Parallelism::RayonDefaultPool { .. } => rayon::spawn(op),
             Parallelism::RayonNewPool(num_threads) => {
-                // TLS 线程池复用（jwalk-meta-naz / jwalk-meta-8cl）：
-                // 同一线程内所有 WalkDir 实例共享同一个 ThreadPool，
-                // 避免频繁创建/销毁线程池的开销。
+                // TLS 线程池复用：同一线程内所有 WalkDir 实例共享同一个
+                // ThreadPool，避免频繁创建/销毁线程池的开销。
                 // 线程池随宿主线程生命周期销毁，rayon::ThreadPool::drop 会
                 // 等待所有工作线程完成后才释放资源。
                 thread_local! {
@@ -724,6 +695,44 @@ impl Parallelism {
             Parallelism::RayonExistingPool { busy_timeout, .. } => *busy_timeout,
         }
     }
+}
+
+/// 重试瞬时 I/O 错误。最多重试 max_retries 次，非首次重试前 yield_now 让出线程。
+/// 非瞬时错误或重试耗尽后立即返回。
+fn retry_transient_io<T>(
+    max_retries: u8,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    for attempt in 0..=max_retries {
+        match op() {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if attempt < max_retries && is_transient_error(&e) {
+                    if attempt > 0 {
+                        std::thread::yield_now();
+                    }
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    // 循环必然通过 return 退出：
+    // - max_retries=0：循环 1 次，失败后 attempt<max_retries=false → return Err
+    // - max_retries>0：最后一次 attempt=max_retries 失败 → return Err
+    unreachable!("retry loop exits via return, not fallthrough")
+}
+
+/// 按文件名对 DirEntry 结果排序。Ok 在 Err 前，Err 之间保持稳定。
+fn sort_dir_entries_by_name<C: ClientState>(
+    entries: &mut [Result<DirEntry<C>>],
+) {
+    entries.sort_unstable_by(|a, b| match (a, b) {
+        (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => Ordering::Equal,
+    });
 }
 
 #[cfg(not(windows))]
@@ -782,19 +791,22 @@ mod read_dir_windows_helpers {
 
     /// 从 file_attributes (u32) 构造 std::fs::FileType
     ///
-    /// SAFETY: 此 transmute 依赖 std::fs::FileType 的内部布局。
-    /// 在 Windows 上 FileType 内部存储为 `[bool; 2]`（is_dir, is_symlink），
-    /// 实际以 `u16` 表示：byte 0 = is_dir, byte 1 = is_symlink。
+    /// SAFETY: 此 transmute 依赖 std::fs::FileType 在 Windows 上的内部布局
+    /// `{ is_directory: bool, is_symlink: bool }`（即 `[bool; 2]`）。
     ///
-    /// 注意：std 并未保证此布局稳定。如果 Rust 标准库未来更改 FileType
-    /// 的内部表示，此 transmute 将产生未定义行为。更安全的替代方案是
-    /// 使用 `From<u32>` 或 `FromRawOs` 等 API（当稳定后）。
+    /// **不可替代性**：std::fs::FileType 没有公开构造函数。NT fast path 只有
+    /// dwFileAttributes，无法通过 `fs::metadata()` 获取 FileType 而不引入额外
+    /// syscall（抵消 NT API 的性能优势）。
     ///
-    /// 依赖的布局定义位于（Rust 1.x）：
-    /// `library/std/src/sys/pal/windows/fs.rs: FileType { is_directory: bool, is_symlink: bool }`
+    /// **防护层**：
+    /// 1. 编译期 size_of 断言（布局 size 变化即编译失败）
+    /// 2. debug 模式运行时 self-test（字段位置变化即 panic）
+    /// 3. 仅在构造 DirEntry.file_type（pub 字段）时调用；
+    ///    make_metadata 已改为直接用 bool，不走此路径
+    ///
+    /// **升级路径**：若 std 未来提供 `FileType::from_bits(u16)` 或稳定
+    /// `From<dwFileAttributes>`，替换此处 transmute。
     pub(super) fn file_type_from_attrs(attrs: u32) -> std::fs::FileType {
-        // 运行时校验：确保 u16 与 FileType 大小一致，
-        // 防止 std 更改布局后静默 UB
         const _: () = assert!(
             std::mem::size_of::<std::fs::FileType>() == std::mem::size_of::<u16>(),
             "FileType layout assumption violated: expected 2 bytes"
@@ -802,16 +814,30 @@ mod read_dir_windows_helpers {
         let is_dir = (attrs & win32_attrs::FILE_ATTRIBUTE_DIRECTORY) != 0;
         let is_sym = (attrs & win32_attrs::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
         let bits: u16 = (is_dir as u16) | ((is_sym as u16) << 8);
+        // debug 模式验证字段位置假设（byte 0 = is_dir, byte 8 = is_symlink）
+        #[cfg(debug_assertions)]
+        {
+            let test_dir: std::fs::FileType = unsafe { std::mem::transmute(1u16) };
+            debug_assert!(test_dir.is_dir() && !test_dir.is_symlink(),
+                "FileType layout drift: bit 0 no longer maps to is_directory");
+            let test_sym: std::fs::FileType = unsafe { std::mem::transmute(256u16) };
+            debug_assert!(!test_sym.is_dir() && test_sym.is_symlink(),
+                "FileType layout drift: bit 8 no longer maps to is_symlink");
+        }
         unsafe { std::mem::transmute(bits) }
     }
 
-    /// 从 DirEntryInfo 构造 MetaData
+    /// 从 DirEntryInfo 构造 MetaData。
+    ///
+    /// 直接从 dwFileAttributes 计算 is_dir/is_symlink，不经 transmute 路径，
+    /// 消除热路径上的 UB 依赖。
     pub(super) fn make_metadata(info: &DirEntryInfo) -> MetaData {
-        let ft = file_type_from_attrs(info.file_attributes);
+        let is_dir = (info.file_attributes & win32_attrs::FILE_ATTRIBUTE_DIRECTORY) != 0;
+        let is_symlink = (info.file_attributes & win32_attrs::FILE_ATTRIBUTE_REPARSE_POINT) != 0;
         MetaData {
-            is_dir: ft.is_dir(),
-            is_file: ft.is_file(),
-            is_symlink: ft.is_symlink(),
+            is_dir,
+            is_file: !is_dir && !is_symlink,
+            is_symlink,
             size: info.file_size,
             created: filetime_to_systemtime(info.creation_time),
             modified: filetime_to_systemtime(info.last_write_time),
@@ -866,7 +892,7 @@ MetaDataExt {
 
     /// 从 DirEntryInfo 构造 DirEntry
     pub(super) fn make_dir_entry<C: ClientState>(
-        info: &DirEntryInfo,
+        info: DirEntryInfo,
         depth: usize,
         parent_path: Arc<Path>,
         read_metadata: bool,
@@ -875,12 +901,12 @@ MetaDataExt {
     follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>>,
     ) -> Result<DirEntry<C>> {
         let entry_metadata = if read_metadata {
-            Some(make_metadata(info))
+            Some(make_metadata(&info))
         } else {
             None
         };
         let entry_metadata_ext = if read_metadata_ext {
-            Some(make_metadata_ext(info, None, read_hardlink_info))
+            Some(make_metadata_ext(&info, None, read_hardlink_info))
         } else {
             None
         };
@@ -890,7 +916,7 @@ MetaDataExt {
             parent_path,
             entry_metadata,
             entry_metadata_ext,
-            info.file_name.clone(),
+            info.file_name,
             file_type,
             follow_link_ancestors,
         )
@@ -1003,8 +1029,9 @@ fn read_dir_windows<C: ClientState>(
         Ok((guard, entries)) => (guard, entries),
         Err(err) => {
             // 如果流式枚举在出错前已调度了子目录，必须报告已调度数量，
-            // 否则 OrderedQueue 的 pending_count 会不匹配，导致消费者永远挂起。
-            // 返回包含错误 DirEntry 的 ReadDir，携带正确的 streamed_child_count。
+            // 否则 OrderedMatcher 的 DFS 序与实际产出不匹配，消费者会卡在
+            // looking_for 永远等不到的子目录上。返回包含错误 DirEntry 的 ReadDir，
+            // 携带正确的 streamed_child_count 让上层推进 matcher。
             if streamed_child_count > 0 {
                 let mut read_dir = ReadDir::new(client_read_state, vec![Err(Error::from_path(0, path.to_path_buf(), err))]);
                 read_dir.streamed_child_count = streamed_child_count;
@@ -1038,7 +1065,7 @@ fn read_dir_windows<C: ClientState>(
 
     // 构造 DirEntry 列表
     let mut dir_entry_results: Vec<_> = entries
-        .iter()
+        .into_iter()
         .filter_map(|info| {
             if skip_hidden && is_hidden_win32(&info.file_name, info.file_attributes) {
                 return None;
@@ -1062,12 +1089,7 @@ fn read_dir_windows<C: ClientState>(
         .collect();
 
     if sort {
-        dir_entry_results.sort_unstable_by(|a, b| match (a, b) {
-            (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
-            (Ok(_), Err(_)) => Ordering::Less,
-            (Err(_), Ok(_)) => Ordering::Greater,
-            (Err(_), Err(_)) => Ordering::Equal,
-        });
+        sort_dir_entries_by_name(&mut dir_entry_results);
     }
 
     if let Some(process_read_dir) = process_read_dir {
@@ -1117,16 +1139,7 @@ fn read_dir_unix<C: ClientState>(
                     if read_metadata_ext {
                         entry_metadata_ext = Some(get_metadata_ext(&metadata));
                     }
-                    entry_metadata = Some(MetaData {
-                        is_dir: metadata.is_dir(),
-                        is_file: metadata.is_file(),
-                        is_symlink: metadata.is_symlink(),
-                        size: metadata.len(),
-                        created: metadata.created().ok(),
-                        modified: metadata.modified().ok(),
-                        accessed: metadata.accessed().ok(),
-                        permissions: Some(metadata.permissions()),
-                    });
+                    entry_metadata = Some(MetaData::from_fs_metadata(&metadata));
                 } else if let Ok(file_type) = fs_dir_entry.file_type() {
                     entry_metadata = Some(MetaData {
                         is_dir: file_type.is_dir(),
@@ -1175,12 +1188,7 @@ fn read_dir_unix<C: ClientState>(
         .collect();
 
     if sort {
-        dir_entry_results.sort_unstable_by(|a, b| match (a, b) {
-            (Ok(a), Ok(b)) => a.file_name.cmp(&b.file_name),
-            (Ok(_), Err(_)) => Ordering::Less,
-            (Err(_), Ok(_)) => Ordering::Greater,
-            (Err(_), Err(_)) => Ordering::Equal,
-        });
+        sort_dir_entries_by_name(&mut dir_entry_results);
     }
 
     if let Some(process_read_dir) = process_read_dir {

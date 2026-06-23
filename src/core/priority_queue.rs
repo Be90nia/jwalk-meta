@@ -58,7 +58,7 @@ where
     T: Send,
 {
     /// 阻塞 push：使用 send 确保子目录调度不丢失。
-    /// channel 容量已设为 524288，实际场景中几乎不会阻塞。
+    /// channel 容量由调用方传入（默认 4096），大目录场景下几乎不会阻塞。
     /// 之前用 try_send 在 channel 满时丢弃调度，导致目录分支被跳过、并行度下降。
     pub fn push(&self, weighted: Weighted<T>) -> Result<(), SendError<Weighted<T>>> {
         let result = self.sender.send(weighted);
@@ -71,7 +71,6 @@ where
     pub fn complete_item(&self) {
         // NOTE: fetch_sub 无 saturating 版本；若 count=0 会下溢为 usize::MAX。
         // 安全性依赖上游逻辑保证 complete_item 只在 push 成功后调用。
-        // 参见 jwalk-meta-lbi / jwalk-meta-779 的 push-send 时序修复。
         self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }

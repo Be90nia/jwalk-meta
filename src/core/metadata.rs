@@ -62,6 +62,23 @@ pub struct MetaData {
     pub permissions: Option<Permissions>,
 }
 
+impl MetaData {
+    /// 从 std::fs::Metadata 构造完整的 MetaData。
+    #[inline]
+    pub fn from_fs_metadata(metadata: &fs::Metadata) -> Self {
+        MetaData {
+            is_dir: metadata.is_dir(),
+            is_file: metadata.is_file(),
+            is_symlink: metadata.is_symlink(),
+            size: metadata.len(),
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+            accessed: metadata.accessed().ok(),
+            permissions: Some(metadata.permissions()),
+        }
+    }
+}
+
 /// 预计算的祖先 metadata identity，用于符号链接循环检测。
 ///
 /// 在添加 ancestor 时一次性计算并存储，避免 follow_symlink 中

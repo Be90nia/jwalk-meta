@@ -10,7 +10,7 @@
 - **NT Native API 枚举** (Windows) — 使用 `NtQueryDirectoryFileEx` + 64KB 批量缓冲区替代 `FindFirstFile/FindNextFile`，单次系统调用获取数百条目，大幅减少用户态-内核态切换
 - **流式子目录分发** — 枚举巨型目录时，每批 NtQuery 发现子目录立即推入调度队列，不等整个目录枚举完成。消除百万级目录的启动延迟
 - **优先淹没算法** — `weight = parent_weight + subdir_count`，子目录越多的分支获得越高调度优先级，自动将更多线程分配给"大水管"子树
-- **有序流式输出** — `Strict` / `Relaxed` 两种排序模式，按需选择一致性与吞吐量
+- **有序流式输出** — DFS 前序保证父目录先于子目录产出，OrderedMatcher 跟踪遍历游标
 - **元数据扩展** — 可选收集文件属性、时间戳、大小等元数据，避免二次 `stat` 调用
 
 ## 性能
@@ -57,10 +57,12 @@ for entry in WalkDir::new("foo").sort(true) {
 use jwalk_meta::WalkDir;
 
 for entry in WalkDir::new("foo")
-    .metadata(Some(Metadata::default()))
+    .read_metadata(true)
 {
     let entry = entry?;
-    println!("{} ({} bytes)", entry.path().display(), entry.metadata().size);
+    if let Some(metadata) = &entry.metadata {
+        println!("{} ({} bytes)", entry.path().display(), metadata.size);
+    }
 }
 ```
 
@@ -68,7 +70,7 @@ for entry in WalkDir::new("foo")
 
 ```
                     ┌─────────────┐
-                    │   Root Dir  │ weight = usize::MAX
+                    │   Root Dir  │ weight = usize::MAX >> 1
                     └──────┬──────┘
                            │
               ┌────────────┼────────────┐
