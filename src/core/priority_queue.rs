@@ -61,16 +61,25 @@ where
     /// channel 容量由调用方传入（默认 4096），大目录场景下几乎不会阻塞。
     /// 之前用 try_send 在 channel 满时丢弃调度，导致目录分支被跳过、并行度下降。
     pub fn push(&self, weighted: Weighted<T>) -> Result<(), SendError<Weighted<T>>> {
-        let result = self.sender.send(weighted);
-        if result.is_ok() {
-            self.pending_count.fetch_add(1, AtomicOrdering::Release);
+        // fetch_add 必须先于 send：消除 send→fetch_add 窗口内的 pending_count==0 误判。
+        // 修复前（send 先于 fetch_add）：consumer 可能在两者之间 drain 并看到
+        // pending_count==0，提前返回 Disconnected，导致 par_bridge 停止、后续元素丢失。
+        // 修复后（fetch_add 先于 send）：元素入 channel 时 pending_count 已 ≥1，
+        // consumer 永远不会误判。send 失败时 fetch_sub 回滚。
+        self.pending_count.fetch_add(1, AtomicOrdering::Release);
+        match self.sender.send(weighted) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.pending_count.fetch_sub(1, AtomicOrdering::Release);
+                Err(e)
+            }
         }
-        result
     }
 
     pub fn complete_item(&self) {
-        // NOTE: fetch_sub 无 saturating 版本；若 count=0 会下溢为 usize::MAX。
-        // 安全性依赖上游逻辑保证 complete_item 只在 push 成功后调用。
+        // AcqRel：consumer 侧 try_next 通过 load(Acquire) 读取，配对保证可见性。
+        // fetch_add 先于 send 保证了不会有下溢（complete_item 只在元素被 consumer
+        // 消费后、worker 处理完时调用，此时 pending_count 必然 ≥1）。
         self.pending_count.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 }

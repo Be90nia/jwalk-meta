@@ -1002,15 +1002,15 @@ fn read_dir_windows<C: ClientState>(
                 follow_link_ancestors: follow_link_ancestors.clone(),
             };
 
-        // 优先淹没算法：统一权重策略
-        // 流式路径：weight = parent_weight + (streamed_count + 1)
-        // 非流式路径(read_dir.rs)：weight = parent_weight + pipe_size
+        // 优先淹没算法：流式路径统一权重 = parent_weight + 1
+        // 所有流式子目录 weight 相同，BinaryHeap 用 IndexPath tiebreak（反向 Ord）
+        // → IndexPath 小的先出 → 先发现先调度（与 OrderedQueue DFS 输出序一致）
         //
-        // 流式阶段 pipe_size 尚不可知（枚举未完成），
-        // 使用 streamed_count+1 作为递增权重下界，
-        // 确保先发现的子目录先被调度（BFS倾向）。
-        // 枚举完成后非流式部分使用完整 pipe_size 统一权重。
-        let weight = parent_weight.saturating_add(streamed_count.get() + 1);
+        // BUG 修复：原 streamed_count+1 递增导致 max-heap 下"后发现先调度"，
+        // 与注释意图相反，且与非流式路径（pipe_size 统一）行为不一致。
+        // 非流式路径(read_dir.rs)仍用 parent_weight + pipe_size（父目录总条目数），
+        // 权重继承确保大管道的分支也获得高优先级。
+        let weight = parent_weight.saturating_add(1);
             if let Some(last) = child_index_path.indices.last_mut() {
                 *last = streamed_count.get();
             }
