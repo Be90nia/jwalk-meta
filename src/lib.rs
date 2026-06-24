@@ -511,11 +511,11 @@ impl<C: ClientState> IntoIterator for WalkDirGeneric<C> {
         let max_retries = self.options.max_retries;
         let channel_capacity = self.options.channel_capacity;
         let max_receive_buffer_size = self.options.max_receive_buffer_size;
-        let process_read_dir = self.options.process_read_dir.clone();
+        let process_read_dir = self.options.process_read_dir;
         let mut root_read_dir_state = self.options.root_read_dir_state;
         let follow_link_ancestors: Option<Arc<Vec<AncestorIdentity>>> = if follow_links {
             // 根条目的 identity 在 from_path 中已 stat，这里预计算
-            AncestorIdentity::from_path(Arc::from(self.root.clone()) as Arc<Path>)
+            AncestorIdentity::from_path(Arc::from(self.root.as_path()))
                 .map(|id| Arc::new(vec![id]))
         } else {
             None
