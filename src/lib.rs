@@ -737,7 +737,7 @@ fn sort_dir_entries_by_name<C: ClientState>(
 
 #[cfg(not(windows))]
 fn is_hidden(file_name: &OsStr) -> bool {
-    file_name.as_bytes().first() == Some(b'.')
+    file_name.as_encoded_bytes().first() == Some(&b'.')
 }
 
 #[cfg(windows)]
