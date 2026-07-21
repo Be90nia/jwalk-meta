@@ -5,7 +5,6 @@
 //!
 //! Usage: cargo +nightly run --example smb_enum_bench -- <path>
 
-use std::io::Write;
 use std::time::Instant;
 
 fn main() {

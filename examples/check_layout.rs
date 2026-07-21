@@ -1,6 +1,7 @@
 use std::mem::{size_of, offset_of};
 
 #[repr(C)]
+#[allow(non_snake_case)]
 struct FILE_ID_BOTH_DIR_INFO {
     NextEntryOffset: u32,
     FileIndex: u32,
