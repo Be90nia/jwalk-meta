@@ -9,8 +9,8 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).cloned().unwrap_or_else(|| ".".to_string());
     let metadata = args.iter().any(|a| a == "--metadata" || a == "-m");
+    let path = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned().unwrap_or_else(|| ".".to_string());
 
     println!("=== jwalk-meta Unix scan ===");
     println!("Path: {}", path);
