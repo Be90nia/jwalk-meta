@@ -62,7 +62,7 @@ fn run_scan(path: &str, metadata: bool) {
 
     let mut walker = jwalk_meta::WalkDir::new(path);
     if metadata {
-        walker = walker.metadata(true);
+        walker = walker.read_metadata(true);
     }
 
     for entry in walker {
