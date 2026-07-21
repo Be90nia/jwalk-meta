@@ -119,7 +119,13 @@ fn scan_ext_hardlink(path: &str) -> (usize, usize, f64, usize) {
             Ok(e) => {
                 entries += 1;
                 if let Some(ref ext) = e.metadata_ext {
-                    if ext.number_of_links.is_some() {
+                    let has_nlink = {
+                        #[cfg(windows)]
+                        { ext.number_of_links.is_some() }
+                        #[cfg(unix)]
+                        { ext.st_nlink > 0 }
+                    };
+                    if has_nlink {
                         with_nlink += 1;
                     }
                 }
