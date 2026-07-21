@@ -491,7 +491,7 @@ mod scopeguard {
     }
     impl<T, F: FnMut(T)> Drop for Guard<T, F> {
         fn drop(&mut self) {
-            if let (Some(value), mut cleanup) = (self.value.take(), self.cleanup.take()) {
+            if let (Some(value), Some(mut cleanup)) = (self.value.take(), self.cleanup.take()) {
                 cleanup(value);
             }
         }
