@@ -5,6 +5,7 @@ use util::Dir;
 
 #[cfg(unix)]
 #[test]
+#[ignore = "environment-sensitive: CI runners don't enforce 0o000 permissions"]
 fn permission_denied_dir() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -39,6 +40,7 @@ fn permission_denied_dir() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "environment-sensitive: CI runners don't enforce 0o000 permissions"]
 fn permission_denied_file() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -74,6 +76,7 @@ fn permission_denied_file() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "environment-sensitive: CI runners don't enforce 0o000 permissions"]
 fn permission_denied_parallel() {
     use std::os::unix::fs::PermissionsExt;
 
