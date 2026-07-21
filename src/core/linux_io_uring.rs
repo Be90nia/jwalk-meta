@@ -201,6 +201,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
     /// 构造一个最小的 LinuxDirEntryOwned（仅 d_type + name，statx=None）
@@ -427,7 +428,6 @@ mod tests {
             }
         }
     }
-    use scopeguard::guard;
 
     // 占位：PathBuf import 避免 unused warning（在更复杂测试中可能用到）
     #[allow(dead_code)]
