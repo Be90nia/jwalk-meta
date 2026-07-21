@@ -1,4 +1,3 @@
-#![cfg(windows)]
 
 //! class 77 (FileStatBasicInformation) 用于 NtQueryDirectoryFileEx 目录枚举的 PoC。
 //!
@@ -9,7 +8,6 @@
 //!
 //! 不修改任何 src/ 生产代码；不引入新依赖；动态加载 ntdll。
 
-#![cfg(windows)]
 
 use std::env;
 use std::ffi::OsString;
@@ -504,6 +502,7 @@ fn walk_next_offset_chain(buffer: &[u8]) -> Vec<usize> {
     offsets
 }
 
+#[cfg(windows)]
 fn main() {
     let args: Vec<String> = env::args().collect();
     let dir = if args.len() >= 2 {
