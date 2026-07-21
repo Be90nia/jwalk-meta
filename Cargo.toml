@@ -12,6 +12,12 @@ categories = ["filesystem", "concurrency"]
 license = "MIT"
 edition = "2021"
 
+[features]
+default = []
+# 启用则强制 Unix 走 std::fs::read_dir fallback（benchmark 对比用）
+# 不启用时 Linux 走 getdents64 直调路径
+legacy-read-dir = []
+
 [badges]
 travis-ci = { repository = "brmmm3/jwalk-meta" }
 
