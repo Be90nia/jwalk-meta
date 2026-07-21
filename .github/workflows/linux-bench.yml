@@ -133,3 +133,161 @@ jobs:
             result_*.txt
             warmup.log
           retention-days: 30
+
+  # ── SMB loopback benchmark ──────────────────────────────────────────
+  # 在 CI 里起 smbd + cifs mount，验证 io_uring 批量 STATX 在网络挂载点的效果
+  smb-benchmark:
+    name: SMB Bench (io_uring vs fstatat)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: smb-bench
+
+      - name: Build scan_unix (release, default features)
+        run: cargo build --release --no-default-features --example scan_unix
+
+      - name: Setup Samba + cifs mount
+        run: |
+          set -euo pipefail
+
+          # 安装 samba + cifs-utils
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq samba cifs-utils
+
+          # 创建共享目录 + 测试目录树
+          sudo mkdir -p /srv/smbshare
+          sudo mkdir -p /srv/smbshare/flat
+          sudo bash -c 'mkdir -p /srv/smbshare/nested/level0/{a,b,c,d,e}'
+
+          # 扁平目录：2K 文件（SMB 较慢，不需要 10K）
+          for i in $(seq 1 2000); do
+            sudo touch /srv/smbshare/flat/f_${i}.txt
+          done
+
+          # 嵌套目录：5 个子目录各 50 文件
+          for d in /srv/smbshare/nested/level0/*; do
+            for i in $(seq 1 50); do
+              sudo touch "$d/f_${i}.txt"
+            done
+          done
+
+          echo '=== SMB share directory layout ==='
+          find /srv/smbshare -maxdepth 2 -type d | head -20
+          echo "Total entries: $(find /srv/smbshare | wc -l)"
+
+          # 确保 guest (nobody) 可读
+          sudo chmod -R 755 /srv/smbshare
+          # 配置 smbd（不用 heredoc，避免 YAML 缩进问题）
+          sudo bash -c 'cat > /etc/samba/smb.conf <<INNER_EOF
+          [global]
+             workgroup = WORKGROUP
+             server string = CI Samba
+             security = user
+             map to guest = Bad User
+             dns proxy = no
+             log level = 1
+
+          [share]
+             path = /srv/smbshare
+             browsable = yes
+             read only = no
+             guest ok = yes
+             create mask = 0644
+             directory mask = 0755
+          INNER_EOF'
+
+          # 启动 smbd
+          sudo smbd
+          sleep 2
+
+          # 验证 smbd 在跑
+          pgrep smbd || { echo 'ERROR: smbd not running'; exit 1; }
+
+          # cifs 挂载（guest 模式，vers=3.0）
+          sudo mkdir -p /mnt/smb_test
+          sudo mount -t cifs //localhost/share /mnt/smb_test -o guest,vers=3.0,cache=none
+
+          # 验证挂载
+          mount | grep cifs
+          ls /mnt/smb_test/ | head -5
+
+      - name: Verify fs_detect picks up SMB
+        run: |
+          echo "=== statfs on SMB mount ==="
+          # df -T 应显示 cifs
+          df -T /mnt/smb_test
+          # stat 应该能工作
+          stat /mnt/smb_test/flat/f_1.txt || echo 'stat failed (may be expected with guest)'
+
+      - name: SMB Benchmark (io_uring path - default features)
+        run: |
+          echo '=== SMB Bench: io_uring path (default features) ==='
+          cargo run --release --no-default-features --example scan_unix -- /mnt/smb_test 2>&1 | tee result_smb_iouring.txt
+
+      - name: SMB Benchmark (fstatat path - with legacy-read-dir)
+        run: |
+          echo '=== SMB Bench: fstatat path (legacy-read-dir) ==='
+          cargo build --release --features legacy-read-dir --example scan_unix
+          cargo run --release --features legacy-read-dir --example scan_unix -- /mnt/smb_test 2>&1 | tee result_smb_fstatat.txt
+
+      - name: SMB Benchmark (flat dir - io_uring)
+        run: |
+          echo '=== SMB Bench: flat dir (2K files) - io_uring ==='
+          cargo run --release --no-default-features --example scan_unix -- /mnt/smb_test/flat 2>&1 | tee result_smb_flat_iouring.txt
+
+      - name: SMB Benchmark (flat dir - fstatat)
+        run: |
+          echo '=== SMB Bench: flat dir (2K files) - fstatat ==='
+          cargo run --release --features legacy-read-dir --example scan_unix -- /mnt/smb_test/flat 2>&1 | tee result_smb_flat_fstatat.txt
+
+      - name: Collect SMB results
+        if: always()
+        run: |
+          {
+            echo '## SMB Benchmark Results'
+            echo ''
+            echo '### Full tree - io_uring (default features)'
+            echo '```'
+            cat result_smb_iouring.txt
+            echo '```'
+            echo ''
+            echo '### Full tree - fstatat (legacy-read-dir)'
+            echo '```'
+            cat result_smb_fstatat.txt
+            echo '```'
+            echo ''
+            echo '### Flat dir - io_uring'
+            echo '```'
+            cat result_smb_flat_iouring.txt
+            echo '```'
+            echo ''
+            echo '### Flat dir - fstatat'
+            echo '```'
+            cat result_smb_flat_fstatat.txt
+            echo '```'
+          } > summary_smb.md
+
+      - name: Unmount SMB
+        if: always()
+        run: |
+          sudo umount /mnt/smb_test 2>/dev/null || true
+          sudo pkill smbd 2>/dev/null || true
+
+      - name: Upload SMB benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smb
+          path: |
+            summary_smb.md
+            result_smb_*.txt
+          retention-days: 30
