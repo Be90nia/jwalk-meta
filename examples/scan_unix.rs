@@ -8,12 +8,13 @@
 //! ```
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| ".".to_string());
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(1).cloned().unwrap_or_else(|| ".".to_string());
+    let metadata = args.iter().any(|a| a == "--metadata" || a == "-m");
 
     println!("=== jwalk-meta Unix scan ===");
     println!("Path: {}", path);
+    println!("Metadata: {}", if metadata { "yes" } else { "no" });
 
     #[cfg(not(unix))]
     {
@@ -39,11 +40,11 @@ fn main() {
 
 
     #[cfg(unix)]
-    run_scan(&path);
+    run_scan(&path, metadata);
 }
 
 #[cfg(unix)]
-fn run_scan(path: &str) {
+fn run_scan(path: &str, metadata: bool) {
     use std::io::Write;
     use std::time::Instant;
 
@@ -59,7 +60,12 @@ fn run_scan(path: &str) {
     let mut last_log = Instant::now();
     let log_interval = std::time::Duration::from_secs(1);
 
-    for entry in jwalk_meta::WalkDir::new(path) {
+    let mut walker = jwalk_meta::WalkDir::new(path);
+    if metadata {
+        walker = walker.metadata(true);
+    }
+
+    for entry in walker {
         match entry {
             Ok(e) => {
                 total_entries += 1;

@@ -231,23 +231,23 @@ jobs:
       - name: SMB Benchmark (io_uring path - default features)
         run: |
           echo '=== SMB Bench: io_uring path (default features) ==='
-          cargo run --release --no-default-features --example scan_unix -- /mnt/smb_test 2>&1 | tee result_smb_iouring.txt
+          cargo run --release --no-default-features --example scan_unix -- --metadata /mnt/smb_test 2>&1 | tee result_smb_iouring.txt
 
       - name: SMB Benchmark (fstatat path - with legacy-read-dir)
         run: |
           echo '=== SMB Bench: fstatat path (legacy-read-dir) ==='
           cargo build --release --features legacy-read-dir --example scan_unix
-          cargo run --release --features legacy-read-dir --example scan_unix -- /mnt/smb_test 2>&1 | tee result_smb_fstatat.txt
+          cargo run --release --features legacy-read-dir --example scan_unix -- --metadata /mnt/smb_test 2>&1 | tee result_smb_fstatat.txt
 
       - name: SMB Benchmark (flat dir - io_uring)
         run: |
           echo '=== SMB Bench: flat dir (2K files) - io_uring ==='
-          cargo run --release --no-default-features --example scan_unix -- /mnt/smb_test/flat 2>&1 | tee result_smb_flat_iouring.txt
+          cargo run --release --no-default-features --example scan_unix -- --metadata /mnt/smb_test/flat 2>&1 | tee result_smb_flat_iouring.txt
 
       - name: SMB Benchmark (flat dir - fstatat)
         run: |
           echo '=== SMB Bench: flat dir (2K files) - fstatat ==='
-          cargo run --release --features legacy-read-dir --example scan_unix -- /mnt/smb_test/flat 2>&1 | tee result_smb_flat_fstatat.txt
+          cargo run --release --features legacy-read-dir --example scan_unix -- --metadata /mnt/smb_test/flat 2>&1 | tee result_smb_flat_fstatat.txt
 
       - name: Collect SMB results
         if: always()

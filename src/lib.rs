@@ -1406,25 +1406,10 @@ fn read_dir_linux_via_getdents<C: ClientState>(
             && need_meta_or_type
             && entries.len() >= crate::core::linux_io_uring::MIN_BATCH_FOR_IO_URING
         {
-            // 诊断：确认 io_uring 路径触发（CI 环境用 eprintln 输出到 stderr）
-            eprintln!(
-                "[jwalk-meta] io_uring batch STATX: path={}, entries={}, strategy={:?}",
-                path.display(), entries.len(), strategy
-            );
+            // 静默 fallback：ring 不可用或 CQE 失败 → entries[i].statx 保持 None，
             // 静默 fallback：ring 不可用或 CQE 失败 → entries[i].statx 保持 None，
             // make_dir_entry_linux 自动降级到 per-entry fstatat（行为与 LocalSync 一致）。
             let _ = crate::core::linux_io_uring::batch_statx_via_io_uring(&mut entries, dirfd);
-        } else {
-            // 诊断：为什么没走 io_uring 路径
-            eprintln!(
-                "[jwalk-meta] fstatat path: path={}, entries={}, strategy={:?}, io_uring={}, need_meta={}, min_batch={}",
-                path.display(),
-                entries.len(),
-                strategy,
-                crate::core::linux_io_uring::io_uring_enabled(),
-                need_meta_or_type,
-                entries.len() >= crate::core::linux_io_uring::MIN_BATCH_FOR_IO_URING
-            );
         }
     }
 
