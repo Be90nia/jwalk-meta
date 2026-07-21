@@ -257,18 +257,20 @@ pub fn file_type_from_dtype(d_type: u8) -> Option<std::fs::FileType> {
 
 /// 从 st_mode 构造 FileType（用于 fstatat fallback 与 d_type → FileType 映射）。
 ///
-/// SAFETY: `std::fs::FileType` 在 Linux 上内部布局为 `{ mode: u32 }`（mode_t）。
-/// stdlib 私有 `FileType::new(mode)` 构造，transmute 是唯一公开路径。
-/// `debug_assert!` 在每次调用校验 size；若 stdlib 未来变更布局（如增加字段），
-/// 断言触发，迫使本函数重新评估。
+/// `std::fs::FileType` 在 Linux 上内部布局为 `{ mode: u32 }`（mode_t）但 stdlib 不暴露构造器。
+/// 不同 Linux 发行版 / 不同 Rust 版本上 FileType 可能有额外 padding（实测 Ubuntu 24.04 是 8 bytes）。
+/// 用字节 buffer + ptr::read 避免 transmute 的 size 等价要求：把 mode 写入 buffer 前 N 字节，
+/// 后续 padding 为零，不影响 FileType::is_dir/is_file 等 mode 位判断。
 pub fn file_type_from_mode(mode: libc::mode_t) -> std::fs::FileType {
-    debug_assert_eq!(
-        std::mem::size_of::<std::fs::FileType>(),
-        std::mem::size_of::<libc::mode_t>(),
-        "FileType layout drift: size mismatch with mode_t"
-    );
-    // SAFETY: 见函数级注释；mode_t 在 Linux 为 u32，与 FileType 私有 mode 字段一致。
-    unsafe { std::mem::transmute(mode) }
+    const FT_SIZE: usize = std::mem::size_of::<std::fs::FileType>();
+    const MODE_SIZE: usize = std::mem::size_of::<libc::mode_t>();
+    // 编译期保证 buffer 能容下 mode_t
+    const _: () = assert!(FT_SIZE >= MODE_SIZE);
+    let mut buf = [0u8; FT_SIZE];
+    buf[..MODE_SIZE].copy_from_slice(&mode.to_ne_bytes());
+    // SAFETY: buf 已零初始化，前 MODE_SIZE 字节来自合法 mode_t；
+    // FileType 是 POD 类型，ptr::read 不产生 UB。
+    unsafe { std::ptr::read(buf.as_ptr() as *const std::fs::FileType) }
 }
 
 #[cfg(test)]
