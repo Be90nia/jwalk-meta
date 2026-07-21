@@ -802,3 +802,9 @@ fn write_verdict_supported(
 ) {
     let _ = std::fs::create_dir_all("docs");
 }
+
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("class77_poc requires Windows (uses NtQueryDirectoryFileEx + ntdll.dll)");
+}
