@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 //! class 77 (FileStatBasicInformation) 用于 NtQueryDirectoryFileEx 目录枚举的 PoC。
 //!
 //! 目标：验证 class 77 buffer 是否包含 LinkCount 字段。
