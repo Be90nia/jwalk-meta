@@ -17,6 +17,15 @@ default = []
 # 启用则强制 Unix 走 std::fs::read_dir fallback（benchmark 对比用）
 # 不启用时 Linux 走 getdents64 直调路径
 legacy-read-dir = []
+windows-only = []  # Windows-only examples (class77_poc, test_ft)，需要时 --features windows-only
+
+[[example]]
+name = "class77_poc"
+required-features = ["windows-only"]
+
+[[example]]
+name = "test_ft"
+required-features = ["windows-only"]
 
 [badges]
 travis-ci = { repository = "brmmm3/jwalk-meta" }
