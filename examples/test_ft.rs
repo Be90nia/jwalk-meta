@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 use std::fs;
 use std::mem;
 
