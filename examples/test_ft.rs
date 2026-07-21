@@ -1,8 +1,7 @@
-#![cfg(windows)]
-
 use std::fs;
 use std::mem;
 
+#[cfg(windows)]
 fn main() {
     let dir_meta = fs::metadata(r"D:\").unwrap();
     let ft_dir = dir_meta.file_type();
@@ -30,4 +29,9 @@ fn main() {
     let bits_file: u16 = 0u16;
     let file_ft: std::fs::FileType = unsafe { mem::transmute(bits_file) };
     println!("zeros is_dir={} is_file={} is_symlink={}", file_ft.is_dir(), file_ft.is_file(), file_ft.is_symlink());
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("test_ft requires Windows (assumes Windows FileType 2-byte layout)");
 }
