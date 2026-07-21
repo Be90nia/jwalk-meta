@@ -1357,7 +1357,7 @@ fn read_dir_linux_via_getdents<C: ClientState>(
 
     let streamed_child_count = streamed_count.get();
 
-    let (guard, entries) = match entries_result {
+    let (guard, mut entries) = match entries_result {
         Ok((guard, entries)) => (guard, entries),
         Err(err) => {
             // 流式枚举在出错前已调度了子目录时，必须报告已调度数量，
@@ -1376,6 +1376,28 @@ fn read_dir_linux_via_getdents<C: ClientState>(
 
     // DirEntry 构造：d_type 短路判断类型，read_metadata/read_metadata_ext/DT_UNKNOWN 触发 fstatat
     let dirfd = guard.as_raw_fd();
+
+    // ── io_uring 批量 STATX 派发（NetworkAsync 路径）───────────────────────────
+    // 仅对网络挂载（SMB/NFS/CIFS）启用：单次 submit_and_wait 批量获取 statx，
+    // 替代 N 次 per-entry fstatat。本地路径（LocalSync）走下方 fstatat 路径不变。
+    // 历史教训：NTFS MFT 卷级锁让多线程变慢（5367f20 回档），本地 FS 不启用 io_uring。
+    {
+        use crate::core::fs_detect::IoStrategy;
+        let strategy = IO_STRATEGY_CACHE.with(|c| c.borrow_mut().detect(path.as_ref()));
+        let need_meta_or_type = read_metadata
+            || read_metadata_ext
+            || entries.iter().any(|e| e.d_type == libc::DT_UNKNOWN);
+        if strategy == IoStrategy::NetworkAsync
+            && crate::core::linux_io_uring::io_uring_enabled()
+            && need_meta_or_type
+            && entries.len() >= crate::core::linux_io_uring::MIN_BATCH_FOR_IO_URING
+        {
+            // 静默 fallback：ring 不可用或 CQE 失败 → entries[i].statx 保持 None，
+            // make_dir_entry_linux 自动降级到 per-entry fstatat（行为与 LocalSync 一致）。
+            let _ = crate::core::linux_io_uring::batch_statx_via_io_uring(&mut entries, dirfd);
+        }
+    }
+
     let mut dir_entry_results: Vec<_> = entries
         .into_iter()
         .filter_map(|info| {
@@ -1422,12 +1444,17 @@ fn read_dir_linux_via_getdents<C: ClientState>(
 
 /// 从 LinuxDirEntryOwned 构造 DirEntry（Linux getdents64 路径专用）。
 ///
+/// 元数据获取优先级：
+/// 1. `info.statx`（io_uring 批量 STATX 预取，NetworkAsync 路径）
+/// 2. `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`（LocalSync / io_uring 失败 fallback）
+/// 3. d_type 推断（statx 与 fstatat 均失败时，metadata 留空）
+///
 /// - `d_type` 短路判断 FileType（避免 fstatat）
-/// - `read_metadata` / `read_metadata_ext` / `DT_UNKNOWN` 触发 `fstatat(AT_SYMLINK_NOFOLLOW)`
-/// - fstatat 失败则降级（FileType 用 d_type 推断，metadata 留空），与原 read_dir_unix 一致
+/// - `read_metadata` / `read_metadata_ext` / `DT_UNKNOWN` 触发 statx 或 fstatat
+/// - stat 字段失败则降级（FileType 用 d_type 推断，metadata 留空），与原 read_dir_unix 一致
 #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
 fn make_dir_entry_linux<C: ClientState>(
-    info: crate::core::unix_dir_enum::LinuxDirEntryOwned,
+    mut info: crate::core::unix_dir_enum::LinuxDirEntryOwned,
     depth: usize,
     parent_path: Arc<Path>,
     read_metadata: bool,
@@ -1440,14 +1467,49 @@ fn make_dir_entry_linux<C: ClientState>(
 
     let need_stat = read_metadata || read_metadata_ext || info.d_type == libc::DT_UNKNOWN;
 
-    // d_type → FileType（DT_UNKNOWN 则降级为 S_IFREG，下面 fstatat 成功后覆盖）
+    // d_type → FileType（DT_UNKNOWN 则降级为 S_IFREG，下面 statx/fstatat 成功后覆盖）
     let mut file_type = file_type_from_dtype(info.d_type)
         .unwrap_or_else(|| file_type_from_mode(libc::S_IFREG));
 
     let mut entry_metadata = None;
     let mut entry_metadata_ext = None;
 
-    if need_stat {
+    // 优先使用 io_uring 批量预取的 statx（NetworkAsync 路径），避免 per-entry fstatat。
+    if let Some(statx) = info.statx.take() {
+        let statx = *statx;
+        let mode = statx.stx_mode as libc::mode_t;
+        if info.d_type == libc::DT_UNKNOWN {
+            file_type = file_type_from_mode(mode);
+        }
+        if read_metadata {
+            entry_metadata = Some(MetaData {
+                is_dir: (mode & libc::S_IFMT) == libc::S_IFDIR,
+                is_file: (mode & libc::S_IFMT) == libc::S_IFREG,
+                is_symlink: (mode & libc::S_IFMT) == libc::S_IFLNK,
+                size: statx.stx_size,
+                // statx 的 stx_btime 是文件创建时间（Linux stat 没有此字段，statx 才有）
+                created: statx_time_to_systemtime(statx.stx_btime),
+                modified: statx_time_to_systemtime(statx.stx_mtime),
+                accessed: statx_time_to_systemtime(statx.stx_atime),
+                permissions: Some(std::fs::Permissions::from_mode(mode)),
+            });
+        }
+        if read_metadata_ext {
+            entry_metadata_ext = Some(MetaDataExt {
+                st_mode: mode as u32,
+                st_ino: statx.stx_ino,
+                // statx 拆分 major/minor；重新编码为 dev_t（与 stat.st_dev 一致）
+                st_dev: linux_makedev(statx.stx_dev_major, statx.stx_dev_minor),
+                st_nlink: statx.stx_nlink as u64,
+                st_blksize: statx.stx_blksize as u64,
+                st_blocks: statx.stx_blocks,
+                st_uid: statx.stx_uid,
+                st_gid: statx.stx_gid,
+                st_rdev: linux_makedev(statx.stx_rdev_major, statx.stx_rdev_minor),
+            });
+        }
+    } else if need_stat {
+        // fstatat fallback（LocalSync 路径 / io_uring 失败 / statx 未预取）
         match fstatat_metadata(dirfd, &info.name) {
             Ok(stat) => {
                 if info.d_type == libc::DT_UNKNOWN {
@@ -1487,7 +1549,6 @@ fn make_dir_entry_linux<C: ClientState>(
             }
         }
     }
-
     DirEntry::from_raw(
         depth,
         parent_path,
@@ -1508,4 +1569,50 @@ fn time_to_systemtime(sec: libc::time_t, nsec: i64) -> Option<std::time::SystemT
         return None;
     }
     UNIX_EPOCH.checked_add(Duration::new(sec as u64, nsec as u32))
+}
+
+/// 将 libc::statx_timestamp 转换为 SystemTime；负秒（epoch 前）返回 None。
+///
+/// statx 用独立的 `statx_timestamp` 结构体（tv_sec: i64 + tv_nsec: u32 + __reserved: i32），
+/// 与 stat 的 split sec/nsec 不同。stx_btime 是创建时间（stat 没有对应字段）。
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+]
+fn statx_time_to_systemtime(ts: libc::statx_timestamp) -> Option<std::time::SystemTime> {
+    use std::time::{Duration, UNIX_EPOCH};
+    if ts.tv_sec < 0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::new(ts.tv_sec as u64, ts.tv_nsec))
+}
+
+/// Linux dev_t 编码（与 glibc `makedev` 宏等价）。
+///
+/// statx 拆分为 stx_dev_major / stx_dev_minor（u32）；stat.st_dev 是编码后的 u64。
+/// 此函数将 statx 的拆分字段重新编码为 dev_t，使 MetaDataExt.st_dev 跨 statx/stat 一致。
+///
+/// 编码公式（linux/bits/sysmacros.h MKDEV）：
+/// ```text
+/// bits  0-7:   minor 低 8 位
+/// bits  8-19:  major 低 12 位
+/// bits 20-31:  minor 高 12 位
+/// bits 32-63:  major 高 20 位
+/// ```
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+]
+fn linux_makedev(major: u32, minor: u32) -> u64 {
+    let major = major as u64;
+    let minor = minor as u64;
+    ((major & 0xfff) << 8)
+        | ((major & 0xfffff000) << 32)
+        | (minor & 0xff)
+        | ((minor & 0xffffff00) << 12)
+}
+
+// per-worker IoStrategy 缓存：rayon 线程池每个 worker 独立持有，避免锁竞争。
+// 同一 st_dev 只 statfs 一次（参考 beads: ntfs-mft-lock-kills-local-io-uring）。
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+]
+thread_local! {
+    static IO_STRATEGY_CACHE: std::cell::RefCell<crate::core::fs_detect::IoStrategyCache> =
+        std::cell::RefCell::new(crate::core::fs_detect::IoStrategyCache::new());
 }
