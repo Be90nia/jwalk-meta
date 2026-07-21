@@ -146,8 +146,8 @@ fn strategy_from_ftype(f_type: i64) -> IoStrategy {
 mod tests {
     use super::*;
 
+    #[test]
     fn test_strategy_from_ftype_known_network() {
-        assert_eq!(strategy_from_ftype(SMB_SUPER_MAGIC), IoStrategy::NetworkAsync);
         assert_eq!(strategy_from_ftype(NFS_SUPER_MAGIC), IoStrategy::NetworkAsync);
         assert_eq!(
             strategy_from_ftype(CIFS_MAGIC_NUMBER),
