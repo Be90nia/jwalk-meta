@@ -1789,7 +1789,16 @@ fn symlink_cycle_detection_with_follow() {
 
     let wd = WalkDir::new(dir.path()).follow_links(true).sort(true);
     let r = dir.run_recursive(wd);
-    r.assert_no_errors();
+    // follow_links + 循环 symlink 应被检测到，产生 Loop 错误（而非无限循环）
+    let has_loop_error = r
+        .errs()
+        .iter()
+        .any(|e| format!("{:?}", e).contains("Loop"));
+    assert!(
+        has_loop_error,
+        "expected Loop error for cycle, got errors: {:?}",
+        r.errs()
+    );
 
     assert!(
         r.ents().len() < 20,
