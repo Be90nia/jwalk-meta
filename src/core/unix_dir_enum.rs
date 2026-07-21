@@ -74,6 +74,11 @@ impl Drop for DirFdGuard {
 pub struct LinuxDirEntryOwned {
     pub d_type: u8,
     pub name: OsString,
+    /// io_uring 批量 STATX 预取结果（NetworkAsync 路径填充）。
+    /// LocalSync / 批量失败 / CQE 错误时为 None，调用方走 fstatat fallback。
+    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+    ]
+    pub statx: Option<Box<libc::statx>>,
 }
 
 /// 打开目录获取 fd（O_RDONLY | O_DIRECTORY | O_CLOEXEC）。
@@ -165,6 +170,9 @@ pub fn enumerate_dir_unix(
                 entries.push(LinuxDirEntryOwned {
                     d_type,
                     name: OsString::from(name),
+                    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+                    ]
+                    statx: None,
                 });
             });
         }
@@ -202,6 +210,9 @@ pub fn enumerate_dir_unix_streaming(
                 let owned = LinuxDirEntryOwned {
                     d_type,
                     name: OsString::from(name),
+                    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+                    ]
+                    statx: None,
                 };
                 if d_type == libc::DT_DIR {
                     on_subdir(&owned);
@@ -432,6 +443,9 @@ mod tests {
                 let owned = LinuxDirEntryOwned {
                     d_type,
                     name: OsString::from(name),
+                    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+                    ]
+                    statx: None,
                 };
                 if d_type == libc::DT_DIR {
                     subdir_names.push(owned.name.clone());

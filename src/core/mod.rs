@@ -14,8 +14,14 @@ mod weighted;
 #[cfg(windows)]
 mod nt_dir_enum;
 
-#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+]
 pub(crate) mod unix_dir_enum;
+#[cfg(target_os = "linux")]
+pub(crate) mod fs_detect;
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+]
+pub(crate) mod linux_io_uring;
 
 use rayon::prelude::*;
 use std::sync::atomic::AtomicBool;
