@@ -22,7 +22,14 @@ fn main() {
     }
 
     #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
-    println!("Backend: Linux getdents64 + fstatat (streaming subdirs enabled)");
+    {
+        let io_uring_status = if jwalk_meta::linux_io_uring_available() {
+            "io_uring batch STATX"
+        } else {
+            "fstatat (io_uring unavailable)"
+        };
+        println!("Backend: Linux getdents64 + {} (streaming subdirs enabled)", io_uring_status);
+    }
 
     #[cfg(all(target_os = "linux", feature = "legacy-read-dir"))]
     println!("Backend: Linux std::fs::read_dir (legacy-read-dir feature ENABLED, baseline benchmark)");

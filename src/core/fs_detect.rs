@@ -19,7 +19,10 @@ use std::path::Path;
 const SMB_SUPER_MAGIC: i64 = 0x517B;
 /// NFS_SUPER_MAGIC — NFSv2/v3/v4
 const NFS_SUPER_MAGIC: i64 = 0x6969;
-/// CIFS_MAGIC_NUMBER — Linux CIFS/SMB2/SMB3 client mount
+/// CIFS_MAGIC_NUMBER — Linux CIFS/SMB1 client mount
+const CIFS_MAGIC_NUMBER: i64 = 0xFF534D42;
+/// SMB2_SUPER_MAGIC — Linux SMB2/SMB3 client mount（vers=2.0/2.1/3.0/3.1.1）
+const SMB2_SUPER_MAGIC: i64 = 0xFE534D42;
 const CIFS_MAGIC_NUMBER: i64 = 0xFF534D42;
 /// EXT4_SUPER_MAGIC（也为 ext2/ext3）
 const EXT4_SUPER_MAGIC: i64 = 0xEF53;
@@ -126,7 +129,7 @@ fn statfs_strategy(path: &Path) -> Option<IoStrategy> {
 fn strategy_from_ftype(f_type: i64) -> IoStrategy {
     match f_type {
         // 网络 FS → io_uring 批量（核心目标：SMB/NFS/CIFS）
-        SMB_SUPER_MAGIC | NFS_SUPER_MAGIC | CIFS_MAGIC_NUMBER => IoStrategy::NetworkAsync,
+        SMB_SUPER_MAGIC | NFS_SUPER_MAGIC | CIFS_MAGIC_NUMBER | SMB2_SUPER_MAGIC => IoStrategy::NetworkAsync,
         // FAT 系列 → 跳过 nlink 查询（nlink 恒为 1）
         MSDOS_SUPER_MAGIC | EXFAT_SUPER_MAGIC => IoStrategy::SkipNlinks,
         // 本地 FS → 串行 fstatat（历史教训：MFT/inode cache 命中后无收益）
@@ -144,12 +147,16 @@ fn strategy_from_ftype(f_type: i64) -> IoStrategy {
 mod tests {
     use super::*;
 
-    #[test]
     fn test_strategy_from_ftype_known_network() {
         assert_eq!(strategy_from_ftype(SMB_SUPER_MAGIC), IoStrategy::NetworkAsync);
         assert_eq!(strategy_from_ftype(NFS_SUPER_MAGIC), IoStrategy::NetworkAsync);
         assert_eq!(
             strategy_from_ftype(CIFS_MAGIC_NUMBER),
+            IoStrategy::NetworkAsync
+        );
+        // SMB2/SMB3 是现代默认协议（vers=2.0/3.0），f_type = 0xFE534D42
+        assert_eq!(
+            strategy_from_ftype(SMB2_SUPER_MAGIC),
             IoStrategy::NetworkAsync
         );
     }

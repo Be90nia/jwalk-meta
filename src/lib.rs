@@ -135,6 +135,20 @@ use crate::core::Weighted;  // 仅 getdents64 流式路径需要
 pub use crate::core::{DirEntry, DirEntryIter, Error, MetaData, MetaDataExt};
 pub use rayon;
 
+/// 返回 io_uring 是否在当前内核可用（Linux-only，运行时探测）。
+///
+/// 非 Linux 或 legacy-read-dir feature 启用时始终返回 false。
+/// 用于示例程序和诊断工具显示后端状态。
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
+pub fn linux_io_uring_available() -> bool {
+    crate::core::linux_io_uring::io_uring_enabled()
+}
+
+#[cfg(not(all(target_os = "linux", not(feature = "legacy-read-dir"))))]
+pub fn linux_io_uring_available() -> bool {
+    false
+}
+
 /// Builder for walking a directory.
 pub type WalkDir = WalkDirGeneric<((), ())>;
 
@@ -1392,9 +1406,25 @@ fn read_dir_linux_via_getdents<C: ClientState>(
             && need_meta_or_type
             && entries.len() >= crate::core::linux_io_uring::MIN_BATCH_FOR_IO_URING
         {
+            // 诊断：确认 io_uring 路径触发（CI 环境用 eprintln 输出到 stderr）
+            eprintln!(
+                "[jwalk-meta] io_uring batch STATX: path={}, entries={}, strategy={:?}",
+                path.display(), entries.len(), strategy
+            );
             // 静默 fallback：ring 不可用或 CQE 失败 → entries[i].statx 保持 None，
             // make_dir_entry_linux 自动降级到 per-entry fstatat（行为与 LocalSync 一致）。
             let _ = crate::core::linux_io_uring::batch_statx_via_io_uring(&mut entries, dirfd);
+        } else {
+            // 诊断：为什么没走 io_uring 路径
+            eprintln!(
+                "[jwalk-meta] fstatat path: path={}, entries={}, strategy={:?}, io_uring={}, need_meta={}, min_batch={}",
+                path.display(),
+                entries.len(),
+                strategy,
+                crate::core::linux_io_uring::io_uring_enabled(),
+                need_meta_or_type,
+                entries.len() >= crate::core::linux_io_uring::MIN_BATCH_FOR_IO_URING
+            );
         }
     }
 
