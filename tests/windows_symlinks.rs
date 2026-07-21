@@ -1,6 +1,8 @@
 mod util;
 
+#[cfg(windows)]
 use jwalk_meta::*;
+#[cfg(windows)]
 use util::Dir;
 
 /// Windows symlink 测试需要管理员权限或开发者模式。

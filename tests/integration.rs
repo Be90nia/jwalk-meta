@@ -1,6 +1,7 @@
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use std::env;
+#[cfg(unix)]
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
