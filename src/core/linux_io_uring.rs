@@ -12,7 +12,17 @@
 //! 本模块用 `Vec::with_capacity(n)` 预分配容量，绝不触发 reallocation；
 //! `submit_and_wait(n)` 同步阻塞，返回时所有 SQE 已被内核消费，buffer 才可释放。
 
-#![cfg(target_os = "linux")]
+#![cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+    ),
+))]
+// io-uring 0.7.x 预编译 sys.rs 白名单（上游 src/sys/mod.rs:18-33），超出范围触发 compile_error。
 
 use crate::core::unix_dir_enum::LinuxDirEntryOwned;
 use io_uring::{opcode, types, IoUring};

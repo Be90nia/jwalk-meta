@@ -139,12 +139,32 @@ pub use rayon;
 ///
 /// 非 Linux 或 legacy-read-dir feature 启用时始终返回 false。
 /// 用于示例程序和诊断工具显示后端状态。
-#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "legacy-read-dir"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+    ),
+))]
 pub fn linux_io_uring_available() -> bool {
     crate::core::linux_io_uring::io_uring_enabled()
 }
 
-#[cfg(not(all(target_os = "linux", not(feature = "legacy-read-dir"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    not(feature = "legacy-read-dir"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+    )
+)))]
 pub fn linux_io_uring_available() -> bool {
     false
 }
@@ -1395,6 +1415,18 @@ fn read_dir_linux_via_getdents<C: ClientState>(
     // 仅对网络挂载（SMB/NFS/CIFS）启用：单次 submit_and_wait 批量获取 statx，
     // 替代 N 次 per-entry fstatat。本地路径（LocalSync）走下方 fstatat 路径不变。
     // 历史教训：NTFS MFT 卷级锁让多线程变慢（5367f20 回档），本地 FS 不启用 io_uring。
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "powerpc64",
+        ),
+    ))]
+    // io-uring 0.7.x 预编译 sys.rs 白名单（上游 src/sys/mod.rs:18-33）：非白名单架构此块整体跳过，
+    // 不引用 linux_io_uring 模块任何符号（unresolved module 会编译失败）。
     {
         use crate::core::fs_detect::IoStrategy;
         let strategy = IO_STRATEGY_CACHE.with(|c| c.borrow_mut().detect(path.as_ref()));
@@ -1539,15 +1571,15 @@ fn make_dir_entry_linux<C: ClientState>(
                         size: stat.st_size as u64,
                         // Linux stat 无 birth time（stx_btime 需 statx(2)），与 fs::Metadata::created() 一致
                         created: None,
-                        modified: time_to_systemtime(stat.st_mtime, stat.st_mtime_nsec),
-                        accessed: time_to_systemtime(stat.st_atime, stat.st_atime_nsec),
+                        modified: time_to_systemtime(stat.st_mtime, stat.st_mtime_nsec as i64),
+                        accessed: time_to_systemtime(stat.st_atime, stat.st_atime_nsec as i64),
                         permissions: Some(std::fs::Permissions::from_mode(mode)),
                     });
                 }
                 if read_metadata_ext {
                     entry_metadata_ext = Some(MetaDataExt {
                         st_mode: stat.st_mode,
-                        st_ino: stat.st_ino,
+                        st_ino: stat.st_ino as u64,
                         st_dev: stat.st_dev,
                         st_nlink: stat.st_nlink as u64,
                         st_blksize: stat.st_blksize as u64,

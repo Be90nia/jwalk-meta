@@ -125,7 +125,7 @@ fn statfs_strategy(path: &Path) -> Option<IoStrategy> {
     if rc < 0 {
         return None;
     }
-    let preliminary = strategy_from_ftype(sfs.f_type);
+    let preliminary = strategy_from_ftype(sfs.f_type as i64);
     if preliminary != IoStrategy::NetworkAsync {
         return Some(preliminary);
     }

@@ -14,13 +14,23 @@ mod weighted;
 #[cfg(windows)]
 mod nt_dir_enum;
 
-#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
-]
+#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir"))
+)]
 pub(crate) mod unix_dir_enum;
 #[cfg(target_os = "linux")]
 pub(crate) mod fs_detect;
-#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
-]
+#[cfg(all(
+    target_os = "linux",
+    not(feature = "legacy-read-dir"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+    ),
+))]
+// io-uring 0.7.x 预编译 sys.rs 白名单（上游 src/sys/mod.rs:18-33），超出范围触发 compile_error。
 pub(crate) mod linux_io_uring;
 
 use rayon::prelude::*;
