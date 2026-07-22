@@ -76,7 +76,7 @@ pub struct LinuxDirEntryOwned {
     pub name: OsString,
     /// io_uring 批量 STATX 预取结果（NetworkAsync 路径填充）。
     /// LocalSync / 批量失败 / CQE 错误时为 None，调用方走 fstatat fallback。
-    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))
     ]
     pub statx: Option<Box<libc::statx>>,
 }
@@ -170,7 +170,7 @@ pub fn enumerate_dir_unix(
                 entries.push(LinuxDirEntryOwned {
                     d_type,
                     name: OsString::from(name),
-                    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+                    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))
                     ]
                     statx: None,
                 });
@@ -210,7 +210,7 @@ pub fn enumerate_dir_unix_streaming(
                 let owned = LinuxDirEntryOwned {
                     d_type,
                     name: OsString::from(name),
-                    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+                    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))
                     ]
                     statx: None,
                 };
@@ -443,7 +443,7 @@ mod tests {
                 let owned = LinuxDirEntryOwned {
                     d_type,
                     name: OsString::from(name),
-                    #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
+                    #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))
                     ]
                     statx: None,
                 };

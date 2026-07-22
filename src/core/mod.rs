@@ -21,6 +21,7 @@ pub(crate) mod unix_dir_enum;
 pub(crate) mod fs_detect;
 #[cfg(all(
     target_os = "linux",
+    target_env = "gnu",
     not(feature = "legacy-read-dir"),
     any(
         target_arch = "x86_64",

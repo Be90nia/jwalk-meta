@@ -14,6 +14,7 @@
 
 #![cfg(all(
     target_os = "linux",
+    target_env = "gnu",
     any(
         target_arch = "x86_64",
         target_arch = "aarch64",
@@ -224,7 +225,7 @@ mod tests {
         LinuxDirEntryOwned {
             d_type,
             name: OsString::from(name),
-            #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
+            #[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))]
             statx: None,
         }
     }

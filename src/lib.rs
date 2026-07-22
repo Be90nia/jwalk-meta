@@ -141,6 +141,7 @@ pub use rayon;
 /// 用于示例程序和诊断工具显示后端状态。
 #[cfg(all(
     target_os = "linux",
+    target_env = "gnu",
     not(feature = "legacy-read-dir"),
     any(
         target_arch = "x86_64",
@@ -1417,6 +1418,7 @@ fn read_dir_linux_via_getdents<C: ClientState>(
     // 历史教训：NTFS MFT 卷级锁让多线程变慢（5367f20 回档），本地 FS 不启用 io_uring。
     #[cfg(all(
         target_os = "linux",
+        target_env = "gnu",
         any(
             target_arch = "x86_64",
             target_arch = "aarch64",
@@ -1522,40 +1524,17 @@ fn make_dir_entry_linux<C: ClientState>(
     let mut entry_metadata_ext = None;
 
     // 优先使用 io_uring 批量预取的 statx（NetworkAsync 路径），避免 per-entry fstatat。
-    if let Some(statx) = info.statx.take() {
-        let statx = *statx;
-        let mode = statx.stx_mode as libc::mode_t;
-        if info.d_type == libc::DT_UNKNOWN {
-            file_type = file_type_from_mode(mode);
-        }
-        if read_metadata {
-            entry_metadata = Some(MetaData {
-                is_dir: (mode & libc::S_IFMT) == libc::S_IFDIR,
-                is_file: (mode & libc::S_IFMT) == libc::S_IFREG,
-                is_symlink: (mode & libc::S_IFMT) == libc::S_IFLNK,
-                size: statx.stx_size,
-                // statx 的 stx_btime 是文件创建时间（Linux stat 没有此字段，statx 才有）
-                created: statx_time_to_systemtime(statx.stx_btime),
-                modified: statx_time_to_systemtime(statx.stx_mtime),
-                accessed: statx_time_to_systemtime(statx.stx_atime),
-                permissions: Some(std::fs::Permissions::from_mode(mode)),
-            });
-        }
-        if read_metadata_ext {
-            entry_metadata_ext = Some(MetaDataExt {
-                st_mode: mode as u32,
-                st_ino: statx.stx_ino,
-                // statx 拆分 major/minor；重新编码为 dev_t（与 stat.st_dev 一致）
-                st_dev: linux_makedev(statx.stx_dev_major, statx.stx_dev_minor),
-                st_nlink: statx.stx_nlink as u64,
-                st_blksize: statx.stx_blksize as u64,
-                st_blocks: statx.stx_blocks,
-                st_uid: statx.stx_uid,
-                st_gid: statx.stx_gid,
-                st_rdev: linux_makedev(statx.stx_rdev_major, statx.stx_rdev_minor),
-            });
-        }
-    } else if need_stat {
+    // statx 路径仅 gnu 可用：libc crate 不为 musl 导出 statx/statx_timestamp/STATX_*，
+    // musl 上 try_fill_from_statx 为 stub（返回 false），自动降级到下方 fstatat。
+    let statx_filled = try_fill_from_statx(
+        &mut info,
+        read_metadata,
+        read_metadata_ext,
+        &mut file_type,
+        &mut entry_metadata,
+        &mut entry_metadata_ext,
+    );
+    if !statx_filled && need_stat {
         // fstatat fallback（LocalSync 路径 / io_uring 失败 / statx 未预取）
         match fstatat_metadata(dirfd, &info.name) {
             Ok(stat) => {
@@ -1607,6 +1586,71 @@ fn make_dir_entry_linux<C: ClientState>(
     )
 }
 
+/// 尝试用 io_uring 批量预取的 statx 填充 file_type / metadata / metadata_ext。
+///
+/// 仅 gnu 路径：`libc` crate 不为 musl target 导出 `statx`/`statx_timestamp`/
+/// `STATX_BASIC_STATS`，musl 上引用 `libc::statx` 会 E0425。返回 true 表示 statx 命中
+/// 并填充了字段（调用方跳过 fstatat）。
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))]
+fn try_fill_from_statx(
+    info: &mut crate::core::unix_dir_enum::LinuxDirEntryOwned,
+    read_metadata: bool,
+    read_metadata_ext: bool,
+    file_type: &mut std::fs::FileType,
+    entry_metadata: &mut Option<MetaData>,
+    entry_metadata_ext: &mut Option<MetaDataExt>,
+) -> bool {
+    use crate::core::unix_dir_enum::file_type_from_mode;
+    use std::os::unix::fs::PermissionsExt;
+    let Some(statx_box) = info.statx.take() else {
+        return false;
+    };
+    let statx = *statx_box;
+    let mode = statx.stx_mode as libc::mode_t;
+    if info.d_type == libc::DT_UNKNOWN {
+        *file_type = file_type_from_mode(mode);
+    }
+    if read_metadata {
+        *entry_metadata = Some(MetaData {
+            is_dir: (mode & libc::S_IFMT) == libc::S_IFDIR,
+            is_file: (mode & libc::S_IFMT) == libc::S_IFREG,
+            is_symlink: (mode & libc::S_IFMT) == libc::S_IFLNK,
+            size: statx.stx_size,
+            created: statx_time_to_systemtime(statx.stx_btime),
+            modified: statx_time_to_systemtime(statx.stx_mtime),
+            accessed: statx_time_to_systemtime(statx.stx_atime),
+            permissions: Some(std::fs::Permissions::from_mode(mode)),
+        });
+    }
+    if read_metadata_ext {
+        *entry_metadata_ext = Some(MetaDataExt {
+            st_mode: mode as u32,
+            st_ino: statx.stx_ino,
+            st_dev: linux_makedev(statx.stx_dev_major, statx.stx_dev_minor),
+            st_nlink: statx.stx_nlink as u64,
+            st_blksize: statx.stx_blksize as u64,
+            st_blocks: statx.stx_blocks,
+            st_uid: statx.stx_uid,
+            st_gid: statx.stx_gid,
+            st_rdev: linux_makedev(statx.stx_rdev_major, statx.stx_rdev_minor),
+        });
+    }
+    true
+}
+
+/// musl / 非 gnu stub：`libc::statx` 在 musl 不导出，直接返回 false 走 fstatat。
+#[cfg(all(target_os = "linux", not(target_env = "gnu"), not(feature = "legacy-read-dir")))]
+fn try_fill_from_statx(
+    _info: &mut crate::core::unix_dir_enum::LinuxDirEntryOwned,
+    _read_metadata: bool,
+    _read_metadata_ext: bool,
+    _file_type: &mut std::fs::FileType,
+    _entry_metadata: &mut Option<MetaData>,
+    _entry_metadata_ext: &mut Option<MetaDataExt>,
+) -> bool {
+    false
+}
+
 /// 将 (秒, 纳秒) 转换为 SystemTime；负秒（epoch 前）返回 None。
 /// Linux glibc 的 stat 字段是 split sec/nsec 形式，不是 timespec。
 #[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))]
@@ -1622,8 +1666,7 @@ fn time_to_systemtime(sec: libc::time_t, nsec: i64) -> Option<std::time::SystemT
 ///
 /// statx 用独立的 `statx_timestamp` 结构体（tv_sec: i64 + tv_nsec: u32 + __reserved: i32），
 /// 与 stat 的 split sec/nsec 不同。stx_btime 是创建时间（stat 没有对应字段）。
-#[cfg(all(target_os = "linux", not(feature = "legacy-read-dir")))
-]
+#[cfg(all(target_os = "linux", target_env = "gnu", not(feature = "legacy-read-dir")))]
 fn statx_time_to_systemtime(ts: libc::statx_timestamp) -> Option<std::time::SystemTime> {
     use std::time::{Duration, UNIX_EPOCH};
     if ts.tv_sec < 0 {

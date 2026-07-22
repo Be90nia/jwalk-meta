@@ -47,7 +47,7 @@ libc =  "0.2"
 #（Cargo 不支持 target.cfg.dependencies 中的 feature= 判断）。
 # 架构白名单与 io-uring crate 上游一致（src/sys/mod.rs:18-33）：
 # io-uring 0.7.x 预编译 sys.rs 仅支持这 5 个架构，超出范围会触发 compile_error。
-[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
+[target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "loongarch64", target_arch = "powerpc64")))'.dependencies]
 io-uring = "0.7"
 
 [dev-dependencies]
