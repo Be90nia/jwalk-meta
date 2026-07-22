@@ -280,6 +280,7 @@ mod tests {
         // CString::new 会拒绝内嵌 NUL
         let path = Path::new("/tmp/foo\0bar");
         let strategy = cache.detect(path);
+        assert_eq!(strategy, IoStrategy::LocalSync);
     }
 
     /// probe_latency 对本地路径应返回 LocalSync（延迟 < 1ms）。

@@ -23,6 +23,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
+// io_uring::types::statx 是 0 字节不透明占位符（doc: "use libc::statx instead"）。
+// SQE 只传递指针值给内核，内核按 Linux statx ABI 解读 buffer。
+// 因此 *mut libc::statx as *mut types::statx 是安全的：两者共享相同的内核 ABI 布局，
+// types::statx 仅用于满足 io_uring crate 的类型签名。
+
 /// io_uring 实例的 SQ/CQ 深度。
 ///
 /// 256 覆盖大多数目录的批量大小；超过则分批（每批一个 ring）。
@@ -147,7 +152,7 @@ fn batch_statx_chunk(
         let sqe = opcode::Statx::new(
             types::Fd(dirfd),
             cstr.as_ptr(),
-            // io_uring types::statx 与 libc::statx 布局一致，cast 安全
+            // SAFETY: types::statx 是 0 字节不透明占位符，SQE 只传指针值给内核。
             statx_bufs[local_idx].as_mut_ptr() as *mut types::statx,
         )
         .flags(libc::AT_SYMLINK_NOFOLLOW as i32)
@@ -429,7 +434,4 @@ mod tests {
         }
     }
 
-    // 占位：PathBuf import 避免 unused warning（在更复杂测试中可能用到）
-    #[allow(dead_code)]
-    fn _path_type_check(_p: PathBuf) {}
 }
