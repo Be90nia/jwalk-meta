@@ -1549,7 +1549,7 @@ fn make_dir_entry_linux<C: ClientState>(
                         st_mode: stat.st_mode,
                         st_ino: stat.st_ino,
                         st_dev: stat.st_dev,
-                        st_nlink: stat.st_nlink,
+                        st_nlink: stat.st_nlink as u64,
                         st_blksize: stat.st_blksize as u64,
                         st_blocks: stat.st_blocks as u64,
                         st_uid: stat.st_uid,
