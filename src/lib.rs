@@ -882,7 +882,9 @@ mod read_dir_windows_helpers {
             is_file: !is_dir && !is_symlink,
             is_symlink,
             size: info.file_size,
+            // Windows creation_time is both birth time and (Python-mirrored) st_ctime.
             created: filetime_to_systemtime(info.creation_time),
+            changed: filetime_to_systemtime(info.creation_time),
             modified: filetime_to_systemtime(info.last_write_time),
             accessed: filetime_to_systemtime(info.last_access_time),
             permissions: None, // NT fast path 不获取权限信息
@@ -1258,6 +1260,7 @@ fn read_dir_unix_fs_legacy<C: ClientState>(
                         is_symlink: file_type.is_symlink(),
                         size: 0,
                         created: None,
+                        changed: None,
                         modified: None,
                         accessed: None,
                         permissions: None,
@@ -1535,43 +1538,92 @@ fn make_dir_entry_linux<C: ClientState>(
         &mut entry_metadata_ext,
     );
     if !statx_filled && need_stat {
-        // fstatat fallback（LocalSync 路径 / io_uring 失败 / statx 未预取）
-        match fstatat_metadata(dirfd, &info.name) {
-            Ok(stat) => {
+        // gnu target: 优先同步 statx（能拿 birth time，io_uring.rs mask 已含 STATX_BTIME）
+        // musl target: libc 不导出 statx，直接走 fstatat（无 btime）
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let statx_sync_ok: bool = match crate::core::unix_dir_enum::statx_metadata(dirfd, &info.name) {
+            Ok(statx) => {
+                let mode = statx.stx_mode as libc::mode_t;
                 if info.d_type == libc::DT_UNKNOWN {
-                    file_type = file_type_from_mode(stat.st_mode);
+                    file_type = file_type_from_mode(mode);
                 }
                 if read_metadata {
-                    let mode = stat.st_mode;
                     entry_metadata = Some(MetaData {
                         is_dir: (mode & libc::S_IFMT) == libc::S_IFDIR,
                         is_file: (mode & libc::S_IFMT) == libc::S_IFREG,
                         is_symlink: (mode & libc::S_IFMT) == libc::S_IFLNK,
-                        size: stat.st_size as u64,
-                        // Linux stat 无 birth time（stx_btime 需 statx(2)），与 fs::Metadata::created() 一致
-                        created: None,
-                        modified: time_to_systemtime(stat.st_mtime, stat.st_mtime_nsec as i64),
-                        accessed: time_to_systemtime(stat.st_atime, stat.st_atime_nsec as i64),
+                        size: statx.stx_size,
+                        created: if statx.stx_mask & libc::STATX_BTIME != 0 {
+                            statx_time_to_systemtime(statx.stx_btime)
+                        } else {
+                            None
+                        },
+                        changed: statx_time_to_systemtime(statx.stx_ctime),
+                        modified: statx_time_to_systemtime(statx.stx_mtime),
+                        accessed: statx_time_to_systemtime(statx.stx_atime),
                         permissions: Some(std::fs::Permissions::from_mode(mode)),
                     });
                 }
                 if read_metadata_ext {
                     entry_metadata_ext = Some(MetaDataExt {
-                        st_mode: stat.st_mode,
-                        st_ino: stat.st_ino as u64,
-                        st_dev: stat.st_dev,
-                        st_nlink: stat.st_nlink as u64,
-                        st_blksize: stat.st_blksize as u64,
-                        st_blocks: stat.st_blocks as u64,
-                        st_uid: stat.st_uid,
-                        st_gid: stat.st_gid,
-                        st_rdev: stat.st_rdev,
+                        st_mode: mode as u32,
+                        st_ino: statx.stx_ino,
+                        st_dev: linux_makedev(statx.stx_dev_major, statx.stx_dev_minor),
+                        st_nlink: statx.stx_nlink as u64,
+                        st_blksize: statx.stx_blksize as u64,
+                        st_blocks: statx.stx_blocks,
+                        st_uid: statx.stx_uid,
+                        st_gid: statx.stx_gid,
+                        st_rdev: linux_makedev(statx.stx_rdev_major, statx.stx_rdev_minor),
                     });
                 }
+                true
             }
-            Err(_) => {
-                // fstatat 失败：file_type 用 d_type 推断（已在上方构造），metadata 留空。
-                // 与原 read_dir_unix 的"metadata() 失败则 file_type() 兜底"语义一致。
+            Err(_) => false,
+        };
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let statx_sync_ok: bool = false;
+
+        if !statx_sync_ok {
+            // fstatat fallback（musl target 或 statx 调用失败）
+            match fstatat_metadata(dirfd, &info.name) {
+                Ok(stat) => {
+                    if info.d_type == libc::DT_UNKNOWN {
+                        file_type = file_type_from_mode(stat.st_mode);
+                    }
+                    if read_metadata {
+                        let mode = stat.st_mode;
+                        entry_metadata = Some(MetaData {
+                            is_dir: (mode & libc::S_IFMT) == libc::S_IFDIR,
+                            is_file: (mode & libc::S_IFMT) == libc::S_IFREG,
+                            is_symlink: (mode & libc::S_IFMT) == libc::S_IFLNK,
+                            size: stat.st_size as u64,
+                            // POSIX stat lacks birth time (stx_btime needs statx(2)).
+                            created: None,
+                            // POSIX change time always present in stat (same source as st_mtime).
+                            changed: time_to_systemtime(stat.st_ctime, stat.st_ctime_nsec as i64),
+                            modified: time_to_systemtime(stat.st_mtime, stat.st_mtime_nsec as i64),
+                            accessed: time_to_systemtime(stat.st_atime, stat.st_atime_nsec as i64),
+                            permissions: Some(std::fs::Permissions::from_mode(mode)),
+                        });
+                    }
+                    if read_metadata_ext {
+                        entry_metadata_ext = Some(MetaDataExt {
+                            st_mode: stat.st_mode,
+                            st_ino: stat.st_ino as u64,
+                            st_dev: stat.st_dev,
+                            st_nlink: stat.st_nlink as u64,
+                            st_blksize: stat.st_blksize as u64,
+                            st_blocks: stat.st_blocks as u64,
+                            st_uid: stat.st_uid,
+                            st_gid: stat.st_gid,
+                            st_rdev: stat.st_rdev,
+                        });
+                    }
+                }
+                Err(_) => {
+                    // fstatat 失败：file_type 用 d_type 推断（已在上方构造），metadata 留空。
+                }
             }
         }
     }
@@ -1616,7 +1668,17 @@ fn try_fill_from_statx(
             is_file: (mode & libc::S_IFMT) == libc::S_IFREG,
             is_symlink: (mode & libc::S_IFMT) == libc::S_IFLNK,
             size: statx.stx_size,
-            created: statx_time_to_systemtime(statx.stx_btime),
+            // Birth time: kernel only fills stx_btime when caller's STATX_BTIME mask bit is set.
+            // io_uring.rs requests STATX_BASIC_STATS|STATX_BTIME; CIFS nounix SMB2/3 + kernel>=4.13
+            // + gnu target returns real btime (Steve French commit 6e70e26dc52b). Mask check
+            // guards against filesystems/kernels that ignore STATX_BTIME (ext3, FAT, kernel<4.11).
+            created: if statx.stx_mask & libc::STATX_BTIME != 0 {
+                statx_time_to_systemtime(statx.stx_btime)
+            } else {
+                None
+            },
+            // stx_ctime is POSIX change time; STATX_BASIC_STATS includes STATX_CTIME so always filled.
+            changed: statx_time_to_systemtime(statx.stx_ctime),
             modified: statx_time_to_systemtime(statx.stx_mtime),
             accessed: statx_time_to_systemtime(statx.stx_atime),
             permissions: Some(std::fs::Permissions::from_mode(mode)),

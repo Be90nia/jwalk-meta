@@ -51,8 +51,15 @@ pub struct MetaData {
     pub is_symlink: bool,
     /// File size in bytes
     pub size: u64,
-    /// Creation time, if available
+    /// Birth time (actual file creation time). Available when filesystem + kernel support it:
+    /// Linux gnu + kernel>=4.13 + statx STATX_BTIME mask (CIFS nounix SMB2/3 supported via
+    /// Steve French commit 6e70e26dc52b); Windows creation_time. None on fs without btime
+    /// (ext3, FAT without mkfs option), musl target (std statx path is gnu-only), or kernel<4.11.
     pub created: Option<SystemTime>,
+    /// POSIX change time (Unix) / creation time (Windows). Matches Python `os.stat_result.st_ctime`:
+    /// - Unix: POSIX change time (`st_ctime` / `statx.stx_ctime`) — always available.
+    /// - Windows: creation time (Windows has no POSIX ctime; Python mirrors this).
+    pub changed: Option<SystemTime>,
     /// Last modification time, if available
     pub modified: Option<SystemTime>,
     /// Last access time, if available
@@ -71,12 +78,50 @@ impl MetaData {
             is_file: metadata.is_file(),
             is_symlink: metadata.is_symlink(),
             size: metadata.len(),
-            created: metadata.created().ok(),
+            created: created_time_from_metadata(metadata),
+            changed: changed_time_from_metadata(metadata),
             modified: metadata.modified().ok(),
             accessed: metadata.accessed().ok(),
             permissions: Some(metadata.permissions()),
         }
     }
+}
+
+/// Extracts `MetaData.changed` from a `std::fs::Metadata`.
+///
+/// Platform-specific implementations are kept in separate cfg-gated functions so the
+/// `from_fs_metadata` body stays a single linear field init with no inline cfg branches.
+///
+/// Note: this is the legacy-read-dir fallback path. The main scan paths (statx/fstatat
+/// in lib.rs) populate `changed` directly from `stat.st_ctime` / `statx.stx_ctime`.
+#[cfg(unix)]
+#[inline]
+fn changed_time_from_metadata(_metadata: &fs::Metadata) -> Option<SystemTime> {
+    // ponytail: std::os::unix::fs::MetadataExt::ctime() is unstable (rust-lang/rust#63010).
+    // Unix stable has no public API to read st_ctime from fs::Metadata without a re-stat.
+    // Returns None; main scan paths (statx/fstatat) populate `changed` directly.
+    None
+}
+
+#[cfg(windows)]
+#[inline]
+fn changed_time_from_metadata(metadata: &fs::Metadata) -> Option<SystemTime> {
+    metadata.created().ok()
+}
+
+/// Extracts `MetaData.created` (birth time) from a `std::fs::Metadata`.
+///
+/// `std::fs::Metadata::created()` is stable across all targets since Rust 1.75
+/// (PR rust-lang/rust#67774, 2020). Returns `Err` (-> None) when:
+/// - musl target (statx path is gnu-only, musl falls back to stat64 which lacks btime),
+/// - kernel < 4.11 (no statx syscall),
+/// - filesystem doesn't support btime (ext3, FAT, etc.).
+///
+/// This is the legacy-read-dir fallback path. The main scan paths (statx/fstatat in lib.rs)
+/// populate `created` directly from `statx.stx_btime` (with STATX_BTIME mask check).
+#[inline]
+fn created_time_from_metadata(metadata: &fs::Metadata) -> Option<SystemTime> {
+    metadata.created().ok()
 }
 
 /// 预计算的祖先 metadata identity，用于符号链接循环检测。

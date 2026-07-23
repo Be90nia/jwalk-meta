@@ -167,7 +167,7 @@ fn batch_statx_chunk(
             statx_bufs[local_idx].as_mut_ptr() as *mut types::statx,
         )
         .flags(libc::AT_SYMLINK_NOFOLLOW as i32)
-        .mask(libc::STATX_BASIC_STATS as u32)
+        .mask((libc::STATX_BASIC_STATS | libc::STATX_BTIME) as u32)
         .build()
         .user_data(local_idx as u64);
 

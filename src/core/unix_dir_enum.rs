@@ -248,6 +248,35 @@ pub fn fstatat_metadata(dirfd: RawFd, name: &OsStr) -> io::Result<libc::stat> {
     }
 }
 
+/// 通过 `statx(dirfd, name, AT_SYMLINK_NOFOLLOW, STATX_BASIC_STATS|STATX_BTIME)` 同步获取 statx。
+///
+/// 与 `fstatat_metadata` 的区别：statx 系统调用能拿 birth time (stx_btime)，fstatat 返回
+/// 的 POSIX `stat` 结构无 btime 字段。scandir 默认走 LocalSync 路径（fstatat fallback），
+/// gnu target 优先用本函数获取 btime，statx 失败才降级 fstatat。
+///
+/// 仅 gnu target：libc crate 不为 musl 导出 statx/statx_timestamp/STATX_*。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn statx_metadata(dirfd: RawFd, name: &OsStr) -> io::Result<libc::statx> {
+    let cstr = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL byte"))?;
+    // SAFETY: cstr NUL 终止；statx 出参 zeroed 初始化（即便 statx 失败也安全）。
+    let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::statx(
+            dirfd,
+            cstr.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS | libc::STATX_BTIME,
+            &mut statx as *mut libc::statx,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(statx)
+    }
+}
+
 /// 从 `d_type` 构造 `std::fs::FileType`。
 ///
 /// 常见类型（dir/reg/lnk/fifo/sock/blk/chr）直接映射；DT_UNKNOWN 返回 `None`，
